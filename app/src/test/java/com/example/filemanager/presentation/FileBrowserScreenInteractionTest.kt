@@ -1,0 +1,116 @@
+package com.example.filemanager.presentation
+
+import androidx.compose.material3.MaterialTheme
+import androidx.compose.material3.Surface
+import androidx.compose.ui.test.assertIsDisplayed
+import androidx.compose.ui.test.hasClickAction
+import androidx.compose.ui.test.hasText
+import androidx.compose.ui.test.junit4.createComposeRule
+import androidx.compose.ui.test.onNodeWithText
+import androidx.compose.ui.test.performClick
+import org.junit.Assert.assertEquals
+import org.junit.Assert.assertTrue
+import org.junit.Rule
+import org.junit.Test
+import org.junit.runner.RunWith
+import org.robolectric.RobolectricTestRunner
+import java.net.URI
+
+@RunWith(RobolectricTestRunner::class)
+class FileBrowserScreenInteractionTest {
+    @get:Rule
+    val composeTestRule = createComposeRule()
+
+    @Test
+    fun clickDirectoryItem_afterLoaded_triggersOnNavigate() {
+        val dirItem = FileEntryUi(
+            uri = URI("file:///storage/emulated/0/Download/DCIM"),
+            name = "DCIM",
+            isDirectory = true,
+            size = 0L,
+            lastModified = 0L,
+        )
+
+        val state = FileBrowserUiState.Success(
+            currentDir = URI("file:///storage/emulated/0/Download"),
+            entries = listOf(dirItem),
+        )
+
+        var navigatedTo: URI? = null
+
+        composeTestRule.setContent {
+            MaterialTheme {
+                Surface {
+                    FileBrowserContent(
+                        state = state,
+                        onGoBack = {},
+                        onRefresh = {},
+                        onPickSafDirectory = {},
+                        onGoLocalRoot = {},
+                        hasAllFilesAccess = true,
+                        onRequestAllFilesAccess = {},
+                        onPasteIntoCurrentDir = {},
+                        onClearClipboard = {},
+                        onOpenDirectory = { uri -> navigatedTo = uri },
+                        onOpenAsText = {},
+                        onCreateFolder = {},
+                        onDelete = {},
+                        onRename = { _, _ -> },
+                        onCopy = {},
+                        onCut = {},
+                        onDismissTextViewer = {},
+                        onSetRoot = {},
+                    )
+                }
+            }
+        }
+
+        // 文件夹行：语义已合并（text + clickAction），用组合 matcher 精准点击。
+        composeTestRule
+            .onNode(hasText("DCIM").and(hasClickAction()))
+            .assertIsDisplayed()
+            .performClick()
+
+        assertEquals(dirItem.uri, navigatedTo)
+    }
+
+    @Test
+    fun clickRetry_triggersCallback() {
+        val state = FileBrowserUiState.Error(
+            currentDir = URI("file:///storage/emulated/0/Download"),
+            message = "权限被拒绝，请授权。",
+        )
+
+        var retried = false
+
+        composeTestRule.setContent {
+            MaterialTheme {
+                Surface {
+                    FileBrowserContent(
+                        state = state,
+                        onGoBack = {},
+                        onRefresh = { retried = true },
+                        onPickSafDirectory = {},
+                        onGoLocalRoot = {},
+                        hasAllFilesAccess = false,
+                        onRequestAllFilesAccess = {},
+                        onPasteIntoCurrentDir = {},
+                        onClearClipboard = {},
+                        onOpenDirectory = {},
+                        onOpenAsText = {},
+                        onCreateFolder = {},
+                        onDelete = {},
+                        onRename = { _, _ -> },
+                        onCopy = {},
+                        onCut = {},
+                        onDismissTextViewer = {},
+                        onSetRoot = {},
+                    )
+                }
+            }
+        }
+
+        composeTestRule.onNodeWithText("重试").assertIsDisplayed().performClick()
+        assertTrue(retried)
+    }
+}

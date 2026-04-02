@@ -1,0 +1,21 @@
+<?xml version="1.0" encoding="utf-8"?>
+<manifest xmlns:android="http://schemas.android.com/apk/res/android"
+    package="com.example.filemanager">
+
+    <application
+        android:theme="@style/Theme.AndroidFileManager">
+
+        <!-- Compose JVM tests via createComposeRule() 会通过 ActivityScenario 启动一个默认的 ComponentActivity。
+             Robolectric 需要能在 manifest 中解析到该 Activity，否则会抛 Unable to resolve activity。 -->
+        <activity
+            android:name="androidx.activity.ComponentActivity"
+            android:exported="true">
+            <intent-filter>
+                <action android:name="android.intent.action.MAIN" />
+                <category android:name="android.intent.category.LAUNCHER" />
+            </intent-filter>
+        </activity>
+    </application>
+
+</manifest>
+
