@@ -15,6 +15,7 @@ import org.junit.Test
 import org.junit.runner.RunWith
 import org.robolectric.RobolectricTestRunner
 import java.net.URI
+import java.util.Locale
 
 @RunWith(RobolectricTestRunner::class)
 class FileBrowserScreenInteractionTest {
@@ -23,16 +24,16 @@ class FileBrowserScreenInteractionTest {
 
     @Test
     fun clickDirectoryItem_afterLoaded_triggersOnNavigate() {
-        val dirItem = FileEntryUi(
+        val dirItem = fakeEntry(
             uri = URI("file:///storage/emulated/0/Download/DCIM"),
             name = "DCIM",
             isDirectory = true,
             size = 0L,
-            lastModified = 0L,
         )
 
         val state = FileBrowserUiState.Success(
             currentDir = URI("file:///storage/emulated/0/Download"),
+            allEntries = listOf(dirItem),
             entries = listOf(dirItem),
         )
 
@@ -43,21 +44,33 @@ class FileBrowserScreenInteractionTest {
                 Surface {
                     FileBrowserContent(
                         state = state,
+                        preferences = FileBrowserPreferences(),
+                        multiSelection = MultiSelectionState(),
+                        ftpHistory = emptyList(),
                         onGoBack = {},
                         onRefresh = {},
                         onPickSafDirectory = {},
                         onGoLocalRoot = {},
                         hasAllFilesAccess = true,
                         onRequestAllFilesAccess = {},
+                        onNotePendingFtpConnection = {},
+                        onToggleSearch = {},
+                        onSearchQueryChange = {},
+                        onClearSearch = {},
+                        onSetSortOption = {},
+                        onOpenSettings = {},
                         onPasteIntoCurrentDir = {},
                         onClearClipboard = {},
                         onOpenDirectory = { uri -> navigatedTo = uri },
                         onOpenAsText = {},
                         onCreateFolder = {},
-                        onDelete = {},
-                        onRename = { _, _ -> },
-                        onCopy = {},
-                        onCut = {},
+                        onEnterMultiSelection = {},
+                        onToggleSelection = {},
+                        onExitMultiSelection = {},
+                        onSelectAll = {},
+                        onCopySelected = {},
+                        onCutSelected = {},
+                        onDeleteSelected = {},
                         onDismissTextViewer = {},
                         onSetRoot = {},
                     )
@@ -88,21 +101,33 @@ class FileBrowserScreenInteractionTest {
                 Surface {
                     FileBrowserContent(
                         state = state,
+                        preferences = FileBrowserPreferences(),
+                        multiSelection = MultiSelectionState(),
+                        ftpHistory = emptyList(),
                         onGoBack = {},
                         onRefresh = { retried = true },
                         onPickSafDirectory = {},
                         onGoLocalRoot = {},
                         hasAllFilesAccess = false,
                         onRequestAllFilesAccess = {},
+                        onNotePendingFtpConnection = {},
+                        onToggleSearch = {},
+                        onSearchQueryChange = {},
+                        onClearSearch = {},
+                        onSetSortOption = {},
+                        onOpenSettings = {},
                         onPasteIntoCurrentDir = {},
                         onClearClipboard = {},
                         onOpenDirectory = {},
                         onOpenAsText = {},
                         onCreateFolder = {},
-                        onDelete = {},
-                        onRename = { _, _ -> },
-                        onCopy = {},
-                        onCut = {},
+                        onEnterMultiSelection = {},
+                        onToggleSelection = {},
+                        onExitMultiSelection = {},
+                        onSelectAll = {},
+                        onCopySelected = {},
+                        onCutSelected = {},
+                        onDeleteSelected = {},
                         onDismissTextViewer = {},
                         onSetRoot = {},
                     )
@@ -112,5 +137,20 @@ class FileBrowserScreenInteractionTest {
 
         composeTestRule.onNodeWithText("重试").assertIsDisplayed().performClick()
         assertTrue(retried)
+    }
+
+    private fun fakeEntry(uri: URI, name: String, isDirectory: Boolean, size: Long): FileEntryUi {
+        val lower = name.lowercase(Locale.ROOT)
+        return FileEntryUi(
+            uri = uri,
+            name = name,
+            displayName = name,
+            subtitle = "",
+            isDirectory = isDirectory,
+            size = size,
+            lastModified = 0L,
+            nameLower = lower,
+            nameLowerNoDot = lower.removePrefix("."),
+        )
     }
 }

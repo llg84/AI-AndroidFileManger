@@ -75,6 +75,7 @@ import androidx.compose.material3.Scaffold
 import androidx.compose.material3.SnackbarHost
 import androidx.compose.material3.SnackbarHostState
 import androidx.compose.material3.Switch
+import androidx.compose.material3.LinearProgressIndicator
 import androidx.compose.material3.Text
 import androidx.compose.material3.TextButton
 import androidx.compose.material3.TopAppBar
@@ -111,6 +112,7 @@ import androidx.compose.ui.graphics.SolidColor
 import java.net.URI
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
+import kotlin.math.roundToInt
 
 private val FolderBlue = Color(0xFF007AFF)
 private val ImageOrange = Color(0xFFFF9500)
@@ -130,7 +132,7 @@ private val GeekSelectionBackground = Color.LightGray.copy(alpha = 0.30f)
 private val GeekMultiTopBarBackground = Color.LightGray.copy(alpha = 0.50f)
 
 private enum class MainTab(val label: String, val icon: ImageVector) {
-    Browse(label = "浏览", icon = Icons.Filled.Folder),
+    Browse(label = "本地", icon = Icons.Filled.Folder),
     Network(label = "网络", icon = Icons.Filled.Public),
 }
 
@@ -197,6 +199,8 @@ fun FileBrowserScreen(
     val state by viewModel.uiState.collectAsState()
     val prefs by viewModel.preferences.collectAsState()
     val multiSelection by viewModel.multiSelection.collectAsState()
+    val ftpHistory by viewModel.ftpHistory.collectAsState()
+    val copyProgress by viewModel.copyProgress.collectAsState()
 
     var settingsVisible by remember { mutableStateOf(false) }
 
@@ -213,12 +217,16 @@ fun FileBrowserScreen(
         state = state,
         preferences = prefs,
         multiSelection = multiSelection,
+        ftpHistory = ftpHistory,
+        copyProgress = copyProgress,
+        onCancelCopy = { viewModel.cancelPaste() },
         onGoBack = { viewModel.goBack() },
         onRefresh = { viewModel.refresh() },
         onPickSafDirectory = onPickSafDirectory,
         onGoLocalRoot = onGoLocalRoot,
         hasAllFilesAccess = hasAllFilesAccess,
         onRequestAllFilesAccess = onRequestAllFilesAccess,
+        onNotePendingFtpConnection = { viewModel.notePendingFtpConnection(it) },
         onToggleSearch = { viewModel.toggleSearch() },
         onSearchQueryChange = { viewModel.setSearchQuery(it) },
         onClearSearch = { viewModel.clearSearch() },
@@ -247,12 +255,16 @@ fun FileBrowserContent(
     state: FileBrowserUiState,
     preferences: FileBrowserPreferences,
     multiSelection: MultiSelectionState,
+    ftpHistory: List<FtpHistoryEntry>,
+    copyProgress: CopyProgressUi?,
+    onCancelCopy: () -> Unit,
     onGoBack: () -> Unit,
     onRefresh: () -> Unit,
     onPickSafDirectory: () -> Unit,
     onGoLocalRoot: () -> Unit,
     hasAllFilesAccess: Boolean,
     onRequestAllFilesAccess: () -> Unit,
+    onNotePendingFtpConnection: (FtpHistoryEntry) -> Unit,
     onToggleSearch: () -> Unit,
     onSearchQueryChange: (String) -> Unit,
     onClearSearch: () -> Unit,
@@ -313,8 +325,8 @@ fun FileBrowserContent(
 
     var batchDeleteDialogVisible by remember { mutableStateOf(false) }
 
-    // Network tab: 服务器配置（当前为内存态，后续可接 DataStore/Room 持久化）。
-    val savedServers = remember { mutableStateListOf<NetworkServerConfig>() }
+    // Network tab: SMB 服务器配置（当前为内存态）；FTP 使用 SharedPreferences 持久化历史。
+    val savedSmbServers = remember { mutableStateListOf<NetworkServerConfig>() }
     var serverDialogVisible by remember { mutableStateOf(false) }
     var serverProtocol by remember { mutableStateOf(NetworkProtocol.SMB) }
     var serverName by remember { mutableStateOf("") }
@@ -324,21 +336,24 @@ fun FileBrowserContent(
     var serverUser by remember { mutableStateOf("") }
     var serverPass by remember { mutableStateOf("") }
     var serverRemotePath by remember { mutableStateOf("") }
+    var ftpHistoryMenuExpanded by remember { mutableStateOf(false) }
 
     fun openServerDialog(protocol: NetworkProtocol) {
         serverProtocol = protocol
-        serverName = ""
-        serverHost = ""
+        val latestFtp: FtpHistoryEntry? = if (protocol == NetworkProtocol.FTP) ftpHistory.firstOrNull() else null
+
+        serverName = latestFtp?.name.orEmpty()
+        serverHost = latestFtp?.host.orEmpty()
         serverPort = when (protocol) {
             NetworkProtocol.SMB -> "445"
-            NetworkProtocol.FTP -> "21"
+            NetworkProtocol.FTP -> (latestFtp?.port ?: 21).toString()
         }
         serverDomain = ""
-        serverUser = ""
-        serverPass = ""
+        serverUser = latestFtp?.username.orEmpty()
+        serverPass = latestFtp?.password.orEmpty()
         serverRemotePath = when (protocol) {
             NetworkProtocol.SMB -> "public/"
-            NetworkProtocol.FTP -> "/"
+            NetworkProtocol.FTP -> latestFtp?.remotePath ?: "/"
         }
         serverDialogVisible = true
     }
@@ -633,7 +648,13 @@ fun FileBrowserContent(
                 MainTab.entries.forEach { tab ->
                     NavigationBarItem(
                         selected = selectedTab == tab,
-                        onClick = { selectedTab = tab },
+                        onClick = {
+                            selectedTab = tab
+                            // 修复：从 FTP/SMB 目录切换回“本地”时，必须重置根目录到本地文件系统。
+                            if (tab == MainTab.Browse) {
+                                onGoLocalRoot()
+                            }
+                        },
                         icon = { Icon(tab.icon, contentDescription = null) },
                         label = { Text(tab.label) },
                     )
@@ -830,7 +851,7 @@ fun FileBrowserContent(
                                 }
                             }
 
-                            if (savedServers.isNotEmpty()) {
+                            if (ftpHistory.isNotEmpty() || savedSmbServers.isNotEmpty()) {
                                 item {
                                     Text(
                                         text = "已保存",
@@ -838,8 +859,52 @@ fun FileBrowserContent(
                                         color = MaterialTheme.colorScheme.onSurfaceVariant,
                                     )
                                 }
+
+                                // FTP：持久化历史
                                 items(
-                                    items = savedServers,
+                                    items = ftpHistory,
+                                    key = { it.dedupKey },
+                                ) { h ->
+                                    ElevatedCard(
+                                        onClick = {
+                                            val uri = buildFtpRootUri(h.host, h.port, h.username, h.password, h.remotePath)
+                                            onNotePendingFtpConnection(h)
+                                            onSetRoot(uri)
+                                            showSnack("已连接：FTP ${h.host}")
+                                        },
+                                        shape = RoundedCornerShape(14.dp),
+                                        colors = CardDefaults.elevatedCardColors(containerColor = MaterialTheme.colorScheme.surface),
+                                    ) {
+                                        Row(
+                                            modifier = Modifier
+                                                .fillMaxWidth()
+                                                .padding(14.dp),
+                                            horizontalArrangement = Arrangement.SpaceBetween,
+                                            verticalAlignment = Alignment.CenterVertically,
+                                        ) {
+                                            Column(modifier = Modifier.weight(1f)) {
+                                                Text(
+                                                    text = h.name.ifBlank { h.host },
+                                                    style = MaterialTheme.typography.bodyLarge,
+                                                    maxLines = 1,
+                                                    overflow = TextOverflow.Ellipsis,
+                                                )
+                                                Text(
+                                                    text = "FTP · ${h.host}:${h.port} · ${h.remotePath}",
+                                                    style = MaterialTheme.typography.bodySmall,
+                                                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                                                    maxLines = 1,
+                                                    overflow = TextOverflow.Ellipsis,
+                                                )
+                                            }
+                                            Text("连接", color = MaterialTheme.colorScheme.primary)
+                                        }
+                                    }
+                                }
+
+                                // SMB：仍保留当前会话内存态（不在本次需求范围内做持久化）
+                                items(
+                                    items = savedSmbServers,
                                     key = { "${it.protocol}-${it.host}-${it.port}-${it.remotePath}-${it.username}" },
                                 ) { cfg ->
                                     ElevatedCard(
@@ -905,6 +970,48 @@ fun FileBrowserContent(
                             onClick = { openServerDialog(NetworkProtocol.FTP) },
                             modifier = Modifier.testTag("ftp_protocol_button"),
                         ) { Text("FTP") }
+
+                        if (serverProtocol == NetworkProtocol.FTP && ftpHistory.isNotEmpty()) {
+                            Box {
+                                IconButton(
+                                    onClick = { ftpHistoryMenuExpanded = true },
+                                    modifier = Modifier.testTag("ftp_history_button"),
+                                ) {
+                                    Icon(Icons.Filled.History, contentDescription = "FTP 历史")
+                                }
+                                DropdownMenu(
+                                    expanded = ftpHistoryMenuExpanded,
+                                    onDismissRequest = { ftpHistoryMenuExpanded = false },
+                                ) {
+                                    ftpHistory.forEach { h ->
+                                        DropdownMenuItem(
+                                            text = {
+                                                Text(
+                                                    text = buildString {
+                                                        append(h.name.ifBlank { h.host })
+                                                        append(" · ")
+                                                        append(h.host)
+                                                        append(":")
+                                                        append(h.port)
+                                                    },
+                                                    maxLines = 1,
+                                                    overflow = TextOverflow.Ellipsis,
+                                                )
+                                            },
+                                            onClick = {
+                                                ftpHistoryMenuExpanded = false
+                                                serverName = h.name
+                                                serverHost = h.host
+                                                serverPort = h.port.toString()
+                                                serverUser = h.username
+                                                serverPass = h.password
+                                                serverRemotePath = h.remotePath
+                                            },
+                                        )
+                                    }
+                                }
+                            }
+                        }
                     }
 
                     androidx.compose.material3.OutlinedTextField(
@@ -994,10 +1101,27 @@ fun FileBrowserContent(
                                 remotePath = remotePath,
                             )
 
-                            if (!savedServers.contains(cfg)) savedServers.add(cfg)
+                            if (cfg.protocol == NetworkProtocol.SMB) {
+                                if (!savedSmbServers.contains(cfg)) savedSmbServers.add(cfg)
+                            }
 
                             val uri = cfg.toRootUri()
                             requireValidRootUri(uri, serverProtocol)
+
+                            // 仅在“验证通过并尝试连接”时记录待保存项；真正持久化在 ViewModel 里以“连接成功”为准。
+                            if (cfg.protocol == NetworkProtocol.FTP) {
+                                onNotePendingFtpConnection(
+                                    FtpHistoryEntry(
+                                        name = cfg.name.ifBlank { cfg.host },
+                                        host = cfg.host,
+                                        port = cfg.port ?: 21,
+                                        username = cfg.username,
+                                        password = cfg.password,
+                                        remotePath = cfg.remotePath,
+                                        lastConnectedAt = System.currentTimeMillis(),
+                                    ),
+                                )
+                            }
 
                             // 先关闭弹窗，避免网络请求/加载耗时导致 UI 看起来“卡住”。
                             serverDialogVisible = false
@@ -1086,6 +1210,73 @@ fun FileBrowserContent(
             },
         )
     }
+
+    // 真实拷贝进度：跨文件系统复制/剪切时展示，直到任务结束。
+    copyProgress?.let { p ->
+        val fraction: Float? = if (p.totalBytes > 0L) {
+            (p.bytesCopied.toDouble() / p.totalBytes.toDouble()).toFloat().coerceIn(0f, 1f)
+        } else {
+            null
+        }
+        val percentText = fraction?.let { "${(it * 100f).roundToInt()}%" }.orEmpty()
+        val progressText = if (p.totalBytes > 0L) {
+            "${formatBytesForUi(p.bytesCopied)} / ${formatBytesForUi(p.totalBytes)}"
+        } else {
+            formatBytesForUi(p.bytesCopied)
+        }
+
+        AlertDialog(
+            onDismissRequest = {},
+            title = { Text("正在${p.stageLabel}") },
+            text = {
+                Column(verticalArrangement = Arrangement.spacedBy(10.dp)) {
+                    Text(
+                        text = p.currentName,
+                        maxLines = 2,
+                        overflow = TextOverflow.Ellipsis,
+                        style = MaterialTheme.typography.bodyMedium,
+                    )
+                    if (fraction != null) {
+                        LinearProgressIndicator(progress = { fraction })
+                        Text(
+                            text = "$percentText · $progressText",
+                            style = MaterialTheme.typography.bodySmall,
+                            color = MaterialTheme.colorScheme.onSurfaceVariant,
+                        )
+                    } else {
+                        LinearProgressIndicator()
+                        Text(
+                            text = progressText,
+                            style = MaterialTheme.typography.bodySmall,
+                            color = MaterialTheme.colorScheme.onSurfaceVariant,
+                        )
+                    }
+                }
+            },
+            confirmButton = {
+                TextButton(onClick = onCancelCopy) { Text("取消") }
+            },
+        )
+    }
+}
+
+private fun formatBytesForUi(bytes: Long): String {
+    val b = bytes.coerceAtLeast(0L)
+    if (b < 1024L) return "$b B"
+    val units = arrayOf("KB", "MB", "GB", "TB")
+    var value = b.toDouble()
+    var unitIndex = -1
+    while (value >= 1024.0 && unitIndex < units.lastIndex) {
+        value /= 1024.0
+        unitIndex++
+    }
+    val unit = units[unitIndex]
+    val number = if (value < 10.0) {
+        String.format(java.util.Locale.ROOT, "%.1f", value).removeSuffix(".0")
+    } else {
+        String.format(java.util.Locale.ROOT, "%.0f", value)
+    }
+    return "$number $unit"
 }
 
 @Composable

@@ -5,6 +5,7 @@ import androidx.compose.material3.Surface
 import app.cash.paparazzi.DeviceConfig
 import app.cash.paparazzi.Paparazzi
 import java.net.URI
+import java.util.Locale
 import org.junit.Rule
 import org.junit.Test
 
@@ -25,46 +26,43 @@ class FileBrowserPaparazziTest {
 
     @Test
     fun fileBrowser_success_snapshot() {
+        val entries = listOf(
+            fakeEntry(
+                uri = URI("file:///storage/emulated/0/Download/DCIM"),
+                name = "DCIM",
+                isDirectory = true,
+                size = 0L,
+            ),
+            fakeEntry(
+                uri = URI("file:///storage/emulated/0/Download/IMG_0001.jpg"),
+                name = "IMG_0001.jpg",
+                isDirectory = false,
+                size = 2_048_000L,
+            ),
+            fakeEntry(
+                uri = URI("file:///storage/emulated/0/Download/合同.pdf"),
+                name = "合同.pdf",
+                isDirectory = false,
+                size = 980_000L,
+            ),
+            fakeEntry(
+                uri = URI("file:///storage/emulated/0/Download/clip.mp4"),
+                name = "clip.mp4",
+                isDirectory = false,
+                size = 12_345_678L,
+            ),
+            fakeEntry(
+                uri = URI("file:///storage/emulated/0/Download/archive.zip"),
+                name = "archive.zip",
+                isDirectory = false,
+                size = 4_321_000L,
+            ),
+        )
         snapshot(
             FileBrowserUiState.Success(
                 currentDir = URI("file:///storage/emulated/0/Download"),
-                entries = listOf(
-                    FileEntryUi(
-                        uri = URI("file:///storage/emulated/0/Download/DCIM"),
-                        name = "DCIM",
-                        isDirectory = true,
-                        size = 0L,
-                        lastModified = 0L,
-                    ),
-                    FileEntryUi(
-                        uri = URI("file:///storage/emulated/0/Download/IMG_0001.jpg"),
-                        name = "IMG_0001.jpg",
-                        isDirectory = false,
-                        size = 2_048_000L,
-                        lastModified = 0L,
-                    ),
-                    FileEntryUi(
-                        uri = URI("file:///storage/emulated/0/Download/合同.pdf"),
-                        name = "合同.pdf",
-                        isDirectory = false,
-                        size = 980_000L,
-                        lastModified = 0L,
-                    ),
-                    FileEntryUi(
-                        uri = URI("file:///storage/emulated/0/Download/clip.mp4"),
-                        name = "clip.mp4",
-                        isDirectory = false,
-                        size = 12_345_678L,
-                        lastModified = 0L,
-                    ),
-                    FileEntryUi(
-                        uri = URI("file:///storage/emulated/0/Download/archive.zip"),
-                        name = "archive.zip",
-                        isDirectory = false,
-                        size = 4_321_000L,
-                        lastModified = 0L,
-                    ),
-                ),
+                allEntries = entries,
+                entries = entries,
             ),
         )
     }
@@ -74,6 +72,7 @@ class FileBrowserPaparazziTest {
         snapshot(
             FileBrowserUiState.Empty(
                 currentDir = URI("file:///storage/emulated/0/Empty"),
+                allEntries = emptyList(),
             ),
         )
     }
@@ -94,26 +93,53 @@ class FileBrowserPaparazziTest {
                 Surface {
                     FileBrowserContent(
                         state = state,
+                        preferences = FileBrowserPreferences(),
+                        multiSelection = MultiSelectionState(),
+                        ftpHistory = emptyList(),
                         onGoBack = {},
                         onRefresh = {},
                         onPickSafDirectory = {},
                         onGoLocalRoot = {},
                         hasAllFilesAccess = true,
                         onRequestAllFilesAccess = {},
+                        onNotePendingFtpConnection = {},
+                        onToggleSearch = {},
+                        onSearchQueryChange = {},
+                        onClearSearch = {},
+                        onSetSortOption = {},
+                        onOpenSettings = {},
                         onPasteIntoCurrentDir = {},
                         onClearClipboard = {},
                         onOpenDirectory = {},
                         onOpenAsText = {},
                         onCreateFolder = {},
-                        onDelete = {},
-                        onRename = { _, _ -> },
-                        onCopy = {},
-                        onCut = {},
+                        onEnterMultiSelection = {},
+                        onToggleSelection = {},
+                        onExitMultiSelection = {},
+                        onSelectAll = {},
+                        onCopySelected = {},
+                        onCutSelected = {},
+                        onDeleteSelected = {},
                         onDismissTextViewer = {},
                         onSetRoot = {},
                     )
                 }
             }
         }
+    }
+
+    private fun fakeEntry(uri: URI, name: String, isDirectory: Boolean, size: Long): FileEntryUi {
+        val lower = name.lowercase(Locale.ROOT)
+        return FileEntryUi(
+            uri = uri,
+            name = name,
+            displayName = name,
+            subtitle = "",
+            isDirectory = isDirectory,
+            size = size,
+            lastModified = 0L,
+            nameLower = lower,
+            nameLowerNoDot = lower.removePrefix("."),
+        )
     }
 }

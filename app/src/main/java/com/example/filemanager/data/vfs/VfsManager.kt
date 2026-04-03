@@ -13,6 +13,7 @@ import com.example.filemanager.domain.vfs.FileSystemProvider
 import com.example.filemanager.domain.vfs.VirtualFile
 import java.io.File
 import java.net.URI
+import java.util.concurrent.CancellationException
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.flow.toList
@@ -132,8 +133,23 @@ class VfsManager(
         cancellationSignal: Job? = null,
         bufferSize: Int = DEFAULT_BUFFER_SIZE,
     ) {
-        // 使用源文件 scheme 对应 provider（实现上都是 stream bridge；此处保持接口一致）。
-        providerFor(sourceFile.uri).copy(
+        val srcProvider = providerFor(sourceFile.uri)
+        val dstProvider = providerFor(destFile.uri)
+
+        // 同一 Provider 内部可留给 Provider 做更高效的实现（例如原生 rename/copy）。
+        // 跨 Provider（例如 ftp -> file / smb -> content）必须走标准流式拷贝：InputStream -> OutputStream。
+        if (srcProvider.scheme != dstProvider.scheme) {
+            streamCopy(
+                sourceFile = sourceFile,
+                destFile = destFile,
+                progressListener = progressListener,
+                cancellationSignal = cancellationSignal,
+                bufferSize = bufferSize,
+            )
+            return
+        }
+
+        srcProvider.copy(
             sourceFile = sourceFile,
             destFile = destFile,
             progressListener = progressListener,
@@ -142,13 +158,43 @@ class VfsManager(
         )
     }
 
+    private suspend fun streamCopy(
+        sourceFile: VirtualFile,
+        destFile: VirtualFile,
+        progressListener: (bytesCopied: Long) -> Unit,
+        cancellationSignal: Job?,
+        bufferSize: Int,
+    ) {
+        withContext(Dispatchers.IO) {
+            sourceFile.openInputStream().use { input ->
+                destFile.openOutputStream(append = false).use { output ->
+                    val buffer = ByteArray(bufferSize)
+                    var total = 0L
+                    while (true) {
+                        if (cancellationSignal?.isCancelled == true) {
+                            throw CancellationException("copy cancelled")
+                        }
+                        val read = input.read(buffer)
+                        if (read <= 0) break
+                        output.write(buffer, 0, read)
+                        total += read
+                        progressListener(total)
+                    }
+                    output.flush()
+                }
+            }
+        }
+    }
+
     suspend fun openChunked(uri: URI, mode: ChunkedOpenMode): ChunkedRandomAccess =
         providerFor(uri).openChunked(uri, mode)
 
     suspend fun listChildren(dirUri: URI): List<VirtualFile> {
-        val dir = getFile(dirUri)
-        if (!dir.isDirectory()) return emptyList()
-        return dir.listFiles().toList()
+        return withContext(Dispatchers.IO) {
+            val dir = getFile(dirUri)
+            if (!dir.isDirectory()) return@withContext emptyList()
+            dir.listFiles().toList()
+        }
     }
 
     companion object {

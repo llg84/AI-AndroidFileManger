@@ -134,6 +134,9 @@ internal class FtpFileSystemProvider(
     private class FtpVirtualFile(
         override val uri: URI,
         private val clientFactory: FtpClientFactory,
+        // 仅用于目录列表批量返回时的“快照元数据”（避免每个文件再单独建控制连接去 stat/isDir/length/mtime）。
+        // 注意：该数据可能不完整（部分服务器 LIST/MLSD 不返回 timestamp/type）。缺失时会回退到网络查询。
+        private val cachedStat: FTPFile? = null,
     ) : VirtualFile {
         private val ftpPath: String = ftpPath(uri)
 
@@ -149,42 +152,79 @@ internal class FtpFileSystemProvider(
             buildUri(uri, parent)
         }
 
-        override suspend fun exists(): Boolean = withContext(Dispatchers.IO) {
-            clientFactory.open(uri).use { it.exists(ftpPath) }
-        }
-
-        override suspend fun isDirectory(): Boolean = withContext(Dispatchers.IO) {
-            clientFactory.open(uri).use { it.isDirectory(ftpPath) }
-        }
-
-        override suspend fun isFile(): Boolean = withContext(Dispatchers.IO) {
-            clientFactory.open(uri).use { it.isFile(ftpPath) }
-        }
-
-        override suspend fun length(): Long = withContext(Dispatchers.IO) {
-            clientFactory.open(uri).use { session ->
-                if (session.isDirectory(ftpPath)) return@withContext 0L
-                session.statFile(ftpPath)?.size ?: 0L
+        override suspend fun exists(): Boolean {
+            // 目录列表中的子项认为存在（避免额外 RTT）。
+            if (cachedStat != null) return true
+            return withContext(Dispatchers.IO) {
+                clientFactory.open(uri).use { it.exists(ftpPath) }
             }
         }
 
-        override suspend fun lastModified(): Long = withContext(Dispatchers.IO) {
-            clientFactory.open(uri).use { session ->
-                if (session.isDirectory(ftpPath)) return@withContext 0L
-                session.statFile(ftpPath)?.timestamp?.timeInMillis ?: 0L
+        override suspend fun isDirectory(): Boolean {
+            cachedStat?.let { stat ->
+                // UNKNOWN_TYPE 时不要盲信，回退网络判定。
+                if (stat.type != FTPFile.UNKNOWN_TYPE) return stat.isDirectory
+            }
+            return withContext(Dispatchers.IO) {
+                clientFactory.open(uri).use { it.isDirectory(ftpPath) }
+            }
+        }
+
+        override suspend fun isFile(): Boolean {
+            cachedStat?.let { stat ->
+                if (stat.type != FTPFile.UNKNOWN_TYPE) return stat.isFile
+            }
+            return withContext(Dispatchers.IO) {
+                clientFactory.open(uri).use { it.isFile(ftpPath) }
+            }
+        }
+
+        override suspend fun length(): Long {
+            cachedStat?.let { stat ->
+                if (stat.type != FTPFile.UNKNOWN_TYPE) {
+                    return if (stat.isDirectory) 0L else stat.size
+                }
+            }
+            return withContext(Dispatchers.IO) {
+                clientFactory.open(uri).use { session ->
+                    if (session.isDirectory(ftpPath)) return@withContext 0L
+                    session.statFile(ftpPath)?.size ?: 0L
+                }
+            }
+        }
+
+        override suspend fun lastModified(): Long {
+            cachedStat?.let { stat ->
+                val ts = stat.timestamp
+                if (ts != null) return ts.timeInMillis
+                if (stat.type != FTPFile.UNKNOWN_TYPE && stat.isDirectory) return 0L
+            }
+            return withContext(Dispatchers.IO) {
+                clientFactory.open(uri).use { session ->
+                    if (session.isDirectory(ftpPath)) return@withContext 0L
+                    session.statFile(ftpPath)?.timestamp?.timeInMillis ?: 0L
+                }
             }
         }
 
         override suspend fun listFiles(): Flow<VirtualFile> {
             return flow {
                 clientFactory.open(uri).use { session ->
-                    val files = session.client.listFiles(ftpPath).orEmpty()
+                    // 优先走 MLSD（一次命令返回结构化元数据），不支持则回退 LIST。
+                    val listed: Array<FTPFile>? = runCatching { session.client.mlistDir(ftpPath) }.getOrNull()
+                    val files = (listed ?: session.client.listFiles(ftpPath)).orEmpty()
                         .filter { it.name != null && it.name != "." && it.name != ".." }
                         .sortedBy { it.name }
                     val base = ftpPath.trimEnd('/').ifBlank { "/" }
                     for (f in files) {
                         val childPath = if (base == "/") "/${f.name}" else "$base/${f.name}"
-                        emit(FtpVirtualFile(uri = buildUri(uri, childPath), clientFactory = clientFactory))
+                        emit(
+                            FtpVirtualFile(
+                                uri = buildUri(uri, childPath),
+                                clientFactory = clientFactory,
+                                cachedStat = f,
+                            ),
+                        )
                     }
                 }
             }.flowOn(Dispatchers.IO)
@@ -252,6 +292,11 @@ internal class FtpFileSystemProvider(
             val client = FTPClient().apply {
                 connectTimeout = 5_000
                 defaultTimeout = 5_000
+
+                // FTP 控制通道默认常见为 ISO-8859-1；为避免中文文件名在 LIST/MLSD 等返回中乱码，强制使用 UTF-8。
+                // 注意：必须在 connect() 之前设置才能生效。
+                setControlEncoding(StandardCharsets.UTF_8.name())
+                setAutodetectUTF8(true)
             }
 
             if (Log.isLoggable(TAG, Log.DEBUG)) {
@@ -268,23 +313,26 @@ internal class FtpFileSystemProvider(
             }
 
             // 打印底层 FTP 交互（USER/PASS/PWD/... 以及服务端 reply）。
-            // 注意：会包含明文密码，仅用于问题定位；如需关闭可通过移除此 listener 或在此处加开关。
-            client.addProtocolCommandListener(
-                PrintCommandListener(
-                    PrintWriter(
-                        object : java.io.OutputStream() {
-                            override fun write(b: Int) {}
-                            override fun write(b: ByteArray, off: Int, len: Int) {
-                                val msg = String(b, off, len).trim()
-                                if (msg.isNotEmpty()) {
-                                    Log.d("FTP_TRAFFIC", msg)
+            // 仅在显式打开 `FTP_TRAFFIC` 的 DEBUG log 时启用，避免常规使用产生额外字符串分配/日志开销。
+            if (Log.isLoggable("FTP_TRAFFIC", Log.DEBUG)) {
+                // 注意：可能包含明文密码，仅用于问题定位。
+                client.addProtocolCommandListener(
+                    PrintCommandListener(
+                        PrintWriter(
+                            object : java.io.OutputStream() {
+                                override fun write(b: Int) {}
+                                override fun write(b: ByteArray, off: Int, len: Int) {
+                                    val msg = String(b, off, len).trim()
+                                    if (msg.isNotEmpty()) {
+                                        Log.d("FTP_TRAFFIC", msg)
+                                    }
                                 }
-                            }
-                        },
+                            },
+                        ),
+                        true,
                     ),
-                    true,
-                ),
-            )
+                )
+            }
 
             try {
                 client.connect(host, port)
@@ -354,6 +402,10 @@ internal class FtpFileSystemProvider(
                 // 将 code/reply 放在前面：即便 UI/日志截断，也更容易看到服务端真实报错（例如 530）。
                 throw IOException("FTP login failed: code=$code reply=$reply user=$user uri=${redactUri(uri)}")
             }
+
+            // 部分 FTP 服务器需要显式打开 UTF-8（否则目录列表仍按默认编码返回）。
+            // 对不支持的服务器忽略失败即可。
+            runCatching { client.sendCommand("OPTS", "UTF8 ON") }
 
             client.setFileType(FTP.BINARY_FILE_TYPE)
             return FtpSession(client)

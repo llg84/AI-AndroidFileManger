@@ -6,6 +6,7 @@ import androidx.lifecycle.ViewModelProvider
 import androidx.lifecycle.viewModelScope
 import androidx.compose.runtime.Immutable
 import android.os.Build
+import android.os.SystemClock
 import android.system.ErrnoException
 import android.system.OsConstants
 import com.example.filemanager.data.vfs.VfsManager
@@ -25,6 +26,8 @@ import kotlinx.coroutines.flow.toList
 import kotlinx.coroutines.flow.update
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
+import org.json.JSONArray
+import org.json.JSONObject
 
 @Immutable
 data class FileEntryUi(
@@ -84,6 +87,30 @@ data class TextViewerState(
     val content: String,
 )
 
+@Immutable
+data class CopyProgressUi(
+    val currentName: String,
+    val bytesCopied: Long,
+    /** 若未知则为 -1。 */
+    val totalBytes: Long,
+    /** 例如："复制" / "创建目录" */
+    val stageLabel: String,
+)
+
+@Immutable
+data class FtpHistoryEntry(
+    val name: String,
+    val host: String,
+    val port: Int,
+    val username: String,
+    val password: String,
+    val remotePath: String,
+    val lastConnectedAt: Long,
+) {
+    val dedupKey: String
+        get() = "$host:$port|$username|${normalizeFtpRemotePath(remotePath)}"
+}
+
 sealed interface FileBrowserUiState {
     data object NoSelection : FileBrowserUiState
 
@@ -138,8 +165,18 @@ class FileBrowserViewModel(
     private val _preferences = MutableStateFlow(loadPreferences())
     val preferences: StateFlow<FileBrowserPreferences> = _preferences.asStateFlow()
 
+    private val _ftpHistory = MutableStateFlow(loadFtpHistoryFromPrefs())
+    val ftpHistory: StateFlow<List<FtpHistoryEntry>> = _ftpHistory.asStateFlow()
+
+    private var pendingFtpConnection: FtpHistoryEntry? = null
+
     private val _multiSelection = MutableStateFlow(MultiSelectionState())
     val multiSelection: StateFlow<MultiSelectionState> = _multiSelection.asStateFlow()
+
+    private val _copyProgress = MutableStateFlow<CopyProgressUi?>(null)
+    val copyProgress: StateFlow<CopyProgressUi?> = _copyProgress.asStateFlow()
+
+    private var pasteJob: Job? = null
 
     private val backStack = ArrayDeque<URI>()
 
@@ -327,12 +364,15 @@ class FileBrowserViewModel(
     fun setRoot(uri: URI) {
         // setRoot 作为入口，必须兜底捕获（避免无权限导致的 SecurityException / AccessDeniedException 直接闪退）。
         runCatching {
+            // 切换根目录时保留剪贴板：支持“从 FTP 复制 -> 切回本地 -> 粘贴”。
+            val clipboard = (_uiState.value as? FileBrowserUiState.HasDir)?.clipboard
             backStack.clear()
             exitMultiSelection()
-            setDirStateLoading(dir = uri, canGoBack = false)
+            setDirStateLoading(dir = uri, canGoBack = false, clipboard = clipboard)
             refresh()
         }.onFailure { e ->
-            setDirStateError(uri, errorMessageFor(e), canGoBack = false, clipboard = null)
+            val clipboard = (_uiState.value as? FileBrowserUiState.HasDir)?.clipboard
+            setDirStateError(uri, errorMessageFor(e), canGoBack = false, clipboard = clipboard)
         }
     }
 
@@ -354,7 +394,14 @@ class FileBrowserViewModel(
                     clipboard = s.clipboard,
                     textViewer = s.textViewer,
                 )
+
+                // 仅在“连接成功”这一刻落盘 FTP 历史：避免目录跳转/刷新导致频繁覆盖。
+                maybePersistFtpHistoryOnSuccess(dirUri)
             }.onFailure { e ->
+                // 连接失败则丢弃 pending，避免后续误落盘。
+                if (dirUri.scheme == "ftp") {
+                    pendingFtpConnection = null
+                }
                 setDirStateError(
                     dir = dirUri,
                     message = errorMessageFor(e),
@@ -363,6 +410,99 @@ class FileBrowserViewModel(
                 )
             }
         }
+    }
+
+    /**
+     * 由 UI 在用户点击“连接(FTP)”时调用：仅暂存待保存信息。
+     * 真正写入 SharedPreferences 的时机在 [refresh] 的 onSuccess（确保连接/目录加载成功）。
+     */
+    fun notePendingFtpConnection(entry: FtpHistoryEntry) {
+        pendingFtpConnection = entry.copy(
+            port = if (entry.port in 1..65535) entry.port else 21,
+            remotePath = normalizeFtpRemotePath(entry.remotePath),
+        )
+    }
+
+    private fun maybePersistFtpHistoryOnSuccess(currentDir: URI) {
+        if (currentDir.scheme != "ftp") return
+        val pending = pendingFtpConnection ?: return
+
+        val host = currentDir.host.orEmpty()
+        val port = if (currentDir.port > 0) currentDir.port else 21
+        val remotePath = normalizeFtpRemotePath(currentDir.path.orEmpty())
+
+        // 只在 host/port/path 与 pending 对齐时落盘（确保确实是“刚才那次连接”）。
+        if (pending.host != host) return
+        if (pending.port != port) return
+        if (normalizeFtpRemotePath(pending.remotePath) != remotePath) return
+
+        pendingFtpConnection = null
+
+        val now = System.currentTimeMillis()
+        val normalized = pending.copy(
+            port = port,
+            remotePath = remotePath,
+            lastConnectedAt = now,
+        )
+
+        val next = upsertFtpHistory(_ftpHistory.value, normalized)
+        _ftpHistory.value = next
+        persistFtpHistoryToPrefs(next)
+    }
+
+    private fun loadFtpHistoryFromPrefs(): List<FtpHistoryEntry> {
+        val raw = prefs.getString(PREF_KEY_FTP_HISTORY, null).orEmpty().trim()
+        if (raw.isBlank()) return emptyList()
+
+        return runCatching {
+            val arr = JSONArray(raw)
+            buildList {
+                for (i in 0 until arr.length()) {
+                    val obj = arr.optJSONObject(i) ?: continue
+                    val host = obj.optString("host").orEmpty().trim()
+                    if (host.isBlank()) continue
+
+                    val port = obj.optInt("port", 21).coerceIn(1, 65535)
+                    val name = obj.optString("name").orEmpty()
+                    val username = obj.optString("username").orEmpty()
+                    val password = obj.optString("password").orEmpty()
+                    val remotePath = normalizeFtpRemotePath(obj.optString("remotePath").orEmpty())
+                    val last = obj.optLong("lastConnectedAt", 0L)
+
+                    add(
+                        FtpHistoryEntry(
+                            name = name,
+                            host = host,
+                            port = port,
+                            username = username,
+                            password = password,
+                            remotePath = remotePath,
+                            lastConnectedAt = last,
+                        ),
+                    )
+                }
+            }
+                .distinctBy { it.dedupKey }
+                .sortedByDescending { it.lastConnectedAt }
+        }.getOrDefault(emptyList())
+    }
+
+    private fun persistFtpHistoryToPrefs(list: List<FtpHistoryEntry>) {
+        val arr = JSONArray()
+        list.forEach { h ->
+            arr.put(
+                JSONObject().apply {
+                    put("name", h.name)
+                    put("host", h.host)
+                    put("port", h.port)
+                    put("username", h.username)
+                    put("password", h.password)
+                    put("remotePath", normalizeFtpRemotePath(h.remotePath))
+                    put("lastConnectedAt", h.lastConnectedAt)
+                },
+            )
+        }
+        prefs.edit().putString(PREF_KEY_FTP_HISTORY, arr.toString()).apply()
     }
 
     fun toggleSearch() {
@@ -523,29 +663,40 @@ class FileBrowserViewModel(
         val s = _uiState.value as? FileBrowserUiState.HasDir ?: return
         val op = s.clipboard ?: return
         val destDirUri = s.currentDir
-        viewModelScope.launch {
+        pasteJob?.cancel()
+        pasteJob = viewModelScope.launch {
             setDirStateLoading(dir = destDirUri, canGoBack = s.canGoBack, clipboard = op)
             try {
-                when (op) {
-                    is ClipboardOp.Copy -> {
-                        for (src in op.sources) {
-                            copyNode(src, destDirUri, deleteSource = false)
+                withContext(Dispatchers.IO) {
+                    when (op) {
+                        is ClipboardOp.Copy -> {
+                            for (src in op.sources) {
+                                copyNode(src, destDirUri, deleteSource = false)
+                            }
                         }
-                    }
-                    is ClipboardOp.Cut -> {
-                        for (src in op.sources) {
-                            copyNode(src, destDirUri, deleteSource = true)
+                        is ClipboardOp.Cut -> {
+                            for (src in op.sources) {
+                                copyNode(src, destDirUri, deleteSource = true)
+                            }
+                            // 只在“搬运完成”后再清空剪贴板。
+                            withContext(Dispatchers.Main.immediate) { clearClipboard() }
                         }
-                        clearClipboard()
                     }
                 }
+                _copyProgress.value = null
                 refresh()
             } catch (e: CancellationException) {
+                _copyProgress.value = null
                 setDirStateError(destDirUri, "操作已取消", canGoBack = s.canGoBack, clipboard = s.clipboard)
             } catch (e: Exception) {
+                _copyProgress.value = null
                 setDirStateError(destDirUri, e.message ?: e.toString(), canGoBack = s.canGoBack, clipboard = s.clipboard)
             }
         }
+    }
+
+    fun cancelPaste() {
+        pasteJob?.cancel()
     }
 
     fun delete(uri: URI) {
@@ -730,6 +881,12 @@ class FileBrowserViewModel(
 
         if (src.isDirectory()) {
             val targetDirName = uniqueChildName(destDirUri, src.name)
+            _copyProgress.value = CopyProgressUi(
+                currentName = targetDirName,
+                bytesCopied = 0L,
+                totalBytes = -1L,
+                stageLabel = "创建目录",
+            )
             val createdDir = vfs.createChildDirectory(destDirUri, targetDirName)
             // 由于 VirtualFile.listFiles() 是 Flow，这里转为 List 便于递归
             val actualChildren = src.listFiles().toList()
@@ -745,7 +902,43 @@ class FileBrowserViewModel(
         // 文件复制
         val targetName = uniqueChildName(destDirUri, src.name)
         val destFile = vfs.createChildFile(destDirUri, targetName)
-        vfs.copy(src, destFile)
+
+        val totalBytes = runCatching { src.length() }.getOrDefault(-1L)
+        _copyProgress.value = CopyProgressUi(
+            currentName = src.name,
+            bytesCopied = 0L,
+            totalBytes = totalBytes,
+            stageLabel = "复制",
+        )
+
+        // 限流 UI 更新：避免每个 buffer 都触发 Compose 重组。
+        var lastUiUpdateAt = 0L
+        var lastUiBytes = 0L
+        val minBytesStep = 256L * 1024L
+        val minTimeStepMs = 80L
+
+        vfs.copy(
+            sourceFile = src,
+            destFile = destFile,
+            progressListener = { bytesCopied ->
+                val now = SystemClock.elapsedRealtime()
+                val shouldUpdate =
+                    bytesCopied - lastUiBytes >= minBytesStep ||
+                        now - lastUiUpdateAt >= minTimeStepMs ||
+                        (totalBytes > 0 && bytesCopied >= totalBytes)
+                if (shouldUpdate) {
+                    lastUiBytes = bytesCopied
+                    lastUiUpdateAt = now
+                    _copyProgress.value = CopyProgressUi(
+                        currentName = src.name,
+                        bytesCopied = bytesCopied,
+                        totalBytes = totalBytes,
+                        stageLabel = "复制",
+                    )
+                }
+            },
+            cancellationSignal = pasteJob,
+        )
 
         if (deleteSource) {
             vfs.delete(sourceUri)
@@ -799,6 +992,23 @@ class FileBrowserViewModelFactory(
 
 private const val PREF_KEY_SORT_OPTION = "sort_option"
 private const val PREF_KEY_SHOW_HIDDEN_FILES = "show_hidden_files"
+private const val PREF_KEY_FTP_HISTORY = "ftp_history_json"
+
+private const val FTP_HISTORY_MAX = 20
+
+private fun normalizeFtpRemotePath(raw: String): String {
+    val p0 = raw.trim().ifBlank { "/" }
+    val p1 = if (p0.startsWith('/')) p0 else "/$p0"
+    return if (p1.endsWith('/')) p1 else "$p1/"
+}
+
+private fun upsertFtpHistory(existing: List<FtpHistoryEntry>, incoming: FtpHistoryEntry): List<FtpHistoryEntry> {
+    val key = incoming.dedupKey
+    val kept = existing.filterNot { it.dedupKey == key }
+    return (listOf(incoming) + kept)
+        .sortedByDescending { it.lastConnectedAt }
+        .take(FTP_HISTORY_MAX)
+}
 
 /**
  * 在每个字符之间强制插入 \u200B（Zero Width Space）。
