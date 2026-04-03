@@ -4,12 +4,17 @@ import android.content.SharedPreferences
 import androidx.lifecycle.ViewModel
 import androidx.lifecycle.ViewModelProvider
 import androidx.lifecycle.viewModelScope
+import androidx.compose.runtime.Immutable
 import android.os.Build
 import android.system.ErrnoException
 import android.system.OsConstants
 import com.example.filemanager.data.vfs.VfsManager
 import com.example.filemanager.domain.vfs.VirtualFile
 import java.net.URI
+import java.text.SimpleDateFormat
+import java.util.Date
+import java.util.Locale
+import kotlinx.coroutines.Job
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.flow.MutableStateFlow
@@ -20,12 +25,21 @@ import kotlinx.coroutines.flow.update
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
 
+@Immutable
 data class FileEntryUi(
     val uri: URI,
+    /** 原始文件名（用于重命名输入、后缀判断等）。 */
     val name: String,
+    /** 列表展示名：仅在必要时插入 \u200B，避免 Compose 重组时做字符串处理。 */
+    val displayName: String,
+    /** 列表副标题：包含类型/大小 + 预格式化时间字符串。 */
+    val subtitle: String,
     val isDirectory: Boolean,
     val size: Long,
     val lastModified: Long,
+    /** 过滤/排序用的预计算 key，避免每次 applyPreferences 反复 lowercase/trim。 */
+    val nameLower: String,
+    val nameLowerNoDot: String,
 )
 
 enum class SortOption(val label: String) {
@@ -47,6 +61,14 @@ data class FileBrowserPreferences(
     val sortOption: SortOption = SortOption.ByName,
     val showHiddenFiles: Boolean = false,
 )
+
+@Immutable
+data class MultiSelectionState(
+    val enabled: Boolean = false,
+    val selectedUris: Set<URI> = emptySet(),
+) {
+    val selectedCount: Int get() = selectedUris.size
+}
 
 sealed class ClipboardOp {
     data class Copy(val sources: List<URI>) : ClipboardOp()
@@ -112,7 +134,13 @@ class FileBrowserViewModel(
     private val _preferences = MutableStateFlow(loadPreferences())
     val preferences: StateFlow<FileBrowserPreferences> = _preferences.asStateFlow()
 
+    private val _multiSelection = MutableStateFlow(MultiSelectionState())
+    val multiSelection: StateFlow<MultiSelectionState> = _multiSelection.asStateFlow()
+
     private val backStack = ArrayDeque<URI>()
+
+    // 过滤/排序可能较重：用可取消的后台 Job 避免在主线程重复计算（例如快速输入搜索）。
+    private var recomputeJob: Job? = null
 
     private fun loadPreferences(): FileBrowserPreferences {
         return FileBrowserPreferences(
@@ -131,20 +159,48 @@ class FileBrowserViewModel(
         prefs.edit().putBoolean(PREF_KEY_SHOW_HIDDEN_FILES, enabled).apply()
     }
 
-    private fun matchesQuery(name: String, rawQuery: String): Boolean {
+    private fun matchesQuery(entry: FileEntryUi, rawQuery: String): Boolean {
         val q = rawQuery.trim()
         if (q.isBlank()) return true
 
         // 直接匹配：保留用户输入（例如包含 '.'、空格等）
-        if (name.contains(q, ignoreCase = true)) return true
+        val qLower = q.lowercase(Locale.ROOT)
+        if (entry.nameLower.contains(qLower)) return true
 
         // 隐藏文件名前缀 '.' 的“归一化”匹配：
         // - 搜索 `trash` 应能命中 `.trash`
-        // - 搜索 `.trash` 也应能命中 `trash`（用户有时会带点输入）
-        val q2 = q.removePrefix(".").lowercase()
+        // - 搜索 `.trash` 也应能命中 `trash`
+        val q2 = qLower.removePrefix(".")
         if (q2.isBlank()) return false
-        val n2 = name.removePrefix(".").lowercase()
-        return n2.contains(q2)
+        return entry.nameLowerNoDot.contains(q2)
+    }
+
+    private fun buildLoadedState(
+        dir: URI,
+        allEntries: List<FileEntryUi>,
+        visibleEntries: List<FileEntryUi>,
+        canGoBack: Boolean,
+        clipboard: ClipboardOp?,
+        textViewer: TextViewerState?,
+    ): FileBrowserUiState.HasDir {
+        return if (visibleEntries.isEmpty()) {
+            FileBrowserUiState.Empty(
+                currentDir = dir,
+                allEntries = allEntries,
+                canGoBack = canGoBack,
+                clipboard = clipboard,
+                textViewer = textViewer,
+            )
+        } else {
+            FileBrowserUiState.Success(
+                currentDir = dir,
+                allEntries = allEntries,
+                entries = visibleEntries,
+                canGoBack = canGoBack,
+                clipboard = clipboard,
+                textViewer = textViewer,
+            )
+        }
     }
 
     private fun applyPreferences(all: List<FileEntryUi>, p: FileBrowserPreferences): List<FileEntryUi> {
@@ -156,14 +212,14 @@ class FileBrowserViewModel(
                 q.isNotBlank() || p.showHiddenFiles || !entry.name.startsWith('.')
             }
             .filter { entry ->
-                matchesQuery(entry.name, q)
+                matchesQuery(entry, q)
             }
 
         val base = compareByDescending<FileEntryUi> { it.isDirectory }
         val comparator = when (p.sortOption) {
-            SortOption.ByName -> base.thenBy { it.name.lowercase() }
-            SortOption.ByTime -> base.thenByDescending { it.lastModified }.thenBy { it.name.lowercase() }
-            SortOption.BySize -> base.thenByDescending { it.size }.thenBy { it.name.lowercase() }
+            SortOption.ByName -> base.thenBy { it.nameLower }
+            SortOption.ByTime -> base.thenByDescending { it.lastModified }.thenBy { it.nameLower }
+            SortOption.BySize -> base.thenByDescending { it.size }.thenBy { it.nameLower }
         }
 
         return filtered.sortedWith(comparator).toList()
@@ -176,23 +232,34 @@ class FileBrowserViewModel(
             is FileBrowserUiState.Empty -> s.allEntries
             else -> return
         }
-        val visible = applyPreferences(all, _preferences.value)
-        _uiState.value = if (visible.isEmpty()) {
-            FileBrowserUiState.Empty(
-                currentDir = s.currentDir,
+
+        val dir = s.currentDir
+        val canGoBack = s.canGoBack
+        val clipboard = s.clipboard
+        val textViewer = s.textViewer
+        val prefsSnapshot = _preferences.value
+
+        recomputeJob?.cancel()
+        recomputeJob = viewModelScope.launch {
+            val visible = withContext(Dispatchers.Default) { applyPreferences(all, prefsSnapshot) }
+
+            // 防止 stale：目录/数据源发生变化时，丢弃旧计算结果。
+            val latest = _uiState.value as? FileBrowserUiState.HasDir ?: return@launch
+            if (latest.currentDir != dir) return@launch
+            val latestAll = when (latest) {
+                is FileBrowserUiState.Success -> latest.allEntries
+                is FileBrowserUiState.Empty -> latest.allEntries
+                else -> return@launch
+            }
+            if (latestAll !== all) return@launch
+
+            _uiState.value = buildLoadedState(
+                dir = dir,
                 allEntries = all,
-                canGoBack = s.canGoBack,
-                clipboard = s.clipboard,
-                textViewer = s.textViewer,
-            )
-        } else {
-            FileBrowserUiState.Success(
-                currentDir = s.currentDir,
-                allEntries = all,
-                entries = visible,
-                canGoBack = s.canGoBack,
-                clipboard = s.clipboard,
-                textViewer = s.textViewer,
+                visibleEntries = visible,
+                canGoBack = canGoBack,
+                clipboard = clipboard,
+                textViewer = textViewer,
             )
         }
     }
@@ -217,34 +284,6 @@ class FileBrowserViewModel(
             clipboard = clipboard,
             textViewer = null,
         )
-    }
-
-    private fun setDirStateLoaded(
-        dir: URI,
-        allEntries: List<FileEntryUi>,
-        canGoBack: Boolean,
-        clipboard: ClipboardOp?,
-        textViewer: TextViewerState? = null,
-    ) {
-        val visible = applyPreferences(allEntries, _preferences.value)
-        _uiState.value = if (visible.isEmpty()) {
-            FileBrowserUiState.Empty(
-                currentDir = dir,
-                allEntries = allEntries,
-                canGoBack = canGoBack,
-                clipboard = clipboard,
-                textViewer = textViewer,
-            )
-        } else {
-            FileBrowserUiState.Success(
-                currentDir = dir,
-                allEntries = allEntries,
-                entries = visible,
-                canGoBack = canGoBack,
-                clipboard = clipboard,
-                textViewer = textViewer,
-            )
-        }
     }
 
     private fun setDirStateError(dir: URI, message: String, canGoBack: Boolean, clipboard: ClipboardOp?) {
@@ -285,6 +324,7 @@ class FileBrowserViewModel(
         // setRoot 作为入口，必须兜底捕获（避免无权限导致的 SecurityException / AccessDeniedException 直接闪退）。
         runCatching {
             backStack.clear()
+            exitMultiSelection()
             setDirStateLoading(dir = uri, canGoBack = false)
             refresh()
         }.onFailure { e ->
@@ -299,9 +339,13 @@ class FileBrowserViewModel(
             runCatching {
                 loadDirectory(dirUri)
             }.onSuccess { list ->
-                setDirStateLoaded(
+                pruneSelectionIfNeeded(currentDir = dirUri, allEntries = list)
+                val prefsSnapshot = _preferences.value
+                val visible = withContext(Dispatchers.Default) { applyPreferences(list, prefsSnapshot) }
+                _uiState.value = buildLoadedState(
                     dir = dirUri,
                     allEntries = list,
+                    visibleEntries = visible,
                     canGoBack = s.canGoBack,
                     clipboard = s.clipboard,
                     textViewer = s.textViewer,
@@ -355,6 +399,7 @@ class FileBrowserViewModel(
         if (current != null) backStack.addLast(current)
 
         val clipboard = (_uiState.value as? FileBrowserUiState.HasDir)?.clipboard
+        exitMultiSelection()
         setDirStateLoading(dir = uri, canGoBack = backStack.isNotEmpty(), clipboard = clipboard)
         refresh()
     }
@@ -362,9 +407,85 @@ class FileBrowserViewModel(
     fun goBack(): Boolean {
         val prev = backStack.removeLastOrNull() ?: return false
         val clipboard = (_uiState.value as? FileBrowserUiState.HasDir)?.clipboard
+        exitMultiSelection()
         setDirStateLoading(dir = prev, canGoBack = backStack.isNotEmpty(), clipboard = clipboard)
         refresh()
         return true
+    }
+
+    fun enterMultiSelection(initialUri: URI) {
+        _multiSelection.update { s ->
+            if (s.enabled) {
+                if (initialUri in s.selectedUris) s else s.copy(selectedUris = s.selectedUris + initialUri)
+            } else {
+                MultiSelectionState(enabled = true, selectedUris = setOf(initialUri))
+            }
+        }
+    }
+
+    fun toggleSelection(uri: URI) {
+        _multiSelection.update { s ->
+            val enabled = s.enabled
+            val current = s.selectedUris
+            val next = if (uri in current) current - uri else current + uri
+            when {
+                !enabled -> MultiSelectionState(enabled = true, selectedUris = setOf(uri))
+                next.isEmpty() -> MultiSelectionState(enabled = false, selectedUris = emptySet())
+                else -> s.copy(selectedUris = next)
+            }
+        }
+    }
+
+    fun exitMultiSelection() {
+        _multiSelection.value = MultiSelectionState(enabled = false, selectedUris = emptySet())
+    }
+
+    fun selectAllVisible() {
+        val s = _uiState.value as? FileBrowserUiState.HasDir ?: return
+        val visibleUris: Set<URI> = when (s) {
+            is FileBrowserUiState.Success -> s.entries.map { it.uri }.toSet()
+            else -> emptySet()
+        }
+        _multiSelection.value = if (visibleUris.isEmpty()) {
+            MultiSelectionState(enabled = false, selectedUris = emptySet())
+        } else {
+            MultiSelectionState(enabled = true, selectedUris = visibleUris)
+        }
+    }
+
+    fun copySelectedToClipboard() {
+        val selected = _multiSelection.value.selectedUris
+        if (selected.isEmpty()) return
+        copyToClipboard(*selected.toTypedArray())
+        exitMultiSelection()
+    }
+
+    fun cutSelectedToClipboard() {
+        val selected = _multiSelection.value.selectedUris
+        if (selected.isEmpty()) return
+        cutToClipboard(*selected.toTypedArray())
+        exitMultiSelection()
+    }
+
+    fun deleteSelected() {
+        val selected = _multiSelection.value.selectedUris
+        if (selected.isEmpty()) return
+
+        viewModelScope.launch {
+            val s = _uiState.value as? FileBrowserUiState.HasDir ?: return@launch
+            val dir = s.currentDir
+            setDirStateLoading(dir = dir, canGoBack = s.canGoBack, clipboard = s.clipboard)
+            runCatching {
+                for (uri in selected) {
+                    vfs.delete(uri)
+                }
+            }.onFailure { e ->
+                setDirStateError(dir, errorMessageFor(e), canGoBack = s.canGoBack, clipboard = s.clipboard)
+                return@launch
+            }
+            exitMultiSelection()
+            refresh()
+        }
     }
 
     fun clearClipboard() {
@@ -482,9 +603,12 @@ class FileBrowserViewModel(
                 runCatching {
                     loadDirectory(s.currentDir)
                 }.onSuccess { list ->
-                    setDirStateLoaded(
+                    val prefsSnapshot = _preferences.value
+                    val visible = withContext(Dispatchers.Default) { applyPreferences(list, prefsSnapshot) }
+                    _uiState.value = buildLoadedState(
                         dir = s.currentDir,
                         allEntries = list,
+                        visibleEntries = visible,
                         canGoBack = s.canGoBack,
                         clipboard = s.clipboard,
                         textViewer = tv,
@@ -516,17 +640,53 @@ class FileBrowserViewModel(
     private suspend fun loadDirectory(dirUri: URI): List<FileEntryUi> {
         return withContext(Dispatchers.IO) {
             val children = vfs.listChildren(dirUri)
-            val mapped = children.map { vf ->
+            val locale = Locale.getDefault()
+            // SimpleDateFormat 创建、Date 分配都较重：这里在 IO 线程单次缓存，避免列表滚动时重组阶段做格式化。
+            val formatter = SimpleDateFormat("yyyy-MM-dd HH:mm", locale)
+            val scratchDate = Date()
+
+            children.map { vf ->
                 val isDir = vf.isDirectory()
+                val name = vf.name
+                val lastModified = runCatching { vf.lastModified() }.getOrDefault(0L)
+                val size = if (isDir) 0L else runCatching { vf.length() }.getOrDefault(0L)
+
+                val displayName = if (shouldInsertZwsForLineBreak(name)) {
+                    insertZeroWidthSpacesBetweenCodePoints(name)
+                } else {
+                    name
+                }
+
+                val time = if (lastModified <= 0L) {
+                    ""
+                } else {
+                    runCatching {
+                        scratchDate.time = lastModified
+                        formatter.format(scratchDate)
+                    }.getOrDefault("")
+                }
+
+                val subtitle = buildString {
+                    append(if (isDir) "目录" else "$size B")
+                    if (time.isNotBlank()) {
+                        append(" · ")
+                        append(time)
+                    }
+                }
+
+                val nameLower = name.lowercase(Locale.ROOT)
                 FileEntryUi(
                     uri = vf.uri,
-                    name = vf.name,
+                    name = name,
+                    displayName = displayName,
+                    subtitle = subtitle,
                     isDirectory = isDir,
-                    size = if (isDir) 0L else vf.length(),
-                    lastModified = vf.lastModified(),
+                    size = size,
+                    lastModified = lastModified,
+                    nameLower = nameLower,
+                    nameLowerNoDot = nameLower.removePrefix("."),
                 )
             }
-            mapped
         }
     }
 
@@ -595,6 +755,23 @@ class FileBrowserViewModel(
             i++
         }
     }
+
+    private fun pruneSelectionIfNeeded(currentDir: URI, allEntries: List<FileEntryUi>) {
+        val ms = _multiSelection.value
+        if (!ms.enabled || ms.selectedUris.isEmpty()) return
+
+        // 只在“仍处于当前目录”时修剪，避免目录切换过程中误删选择。
+        val s = _uiState.value as? FileBrowserUiState.HasDir ?: return
+        if (s.currentDir != currentDir) return
+
+        val existing = allEntries.asSequence().map { it.uri }.toHashSet()
+        val pruned = ms.selectedUris.filterTo(LinkedHashSet()) { it in existing }
+        _multiSelection.value = if (pruned.isEmpty()) {
+            MultiSelectionState(enabled = false, selectedUris = emptySet())
+        } else {
+            ms.copy(selectedUris = pruned)
+        }
+    }
 }
 
 class FileBrowserViewModelFactory(
@@ -610,3 +787,34 @@ class FileBrowserViewModelFactory(
 
 private const val PREF_KEY_SORT_OPTION = "sort_option"
 private const val PREF_KEY_SHOW_HIDDEN_FILES = "show_hidden_files"
+
+private fun shouldInsertZwsForLineBreak(name: String): Boolean {
+    // 只有在“超长连续字母/数字”导致 Text 过早/异常折行时才需要插入 \u200B。
+    // 常规文件名（短、含分隔符）不做处理，避免字符串膨胀与文本排版成本。
+    if (name.length < 32) return false
+
+    var run = 0
+    for (c in name) {
+        val isAsciiWord = (c in 'a'..'z') || (c in 'A'..'Z') || (c in '0'..'9')
+        if (isAsciiWord) {
+            run++
+            if (run >= 16) return true
+        } else {
+            run = 0
+        }
+    }
+    return false
+}
+
+private fun insertZeroWidthSpacesBetweenCodePoints(input: String): String {
+    // 在 code point 之间插入 \u200B（对 emoji/代理对安全）。
+    val sb = StringBuilder(input.length * 2)
+    var i = 0
+    while (i < input.length) {
+        val cp = input.codePointAt(i)
+        sb.appendCodePoint(cp)
+        i += Character.charCount(cp)
+        if (i < input.length) sb.append('\u200B')
+    }
+    return sb.toString()
+}

@@ -1,5 +1,6 @@
 package com.example.filemanager.data.ftp
 
+import android.util.Log
 import com.example.filemanager.domain.vfs.ChunkedOpenMode
 import com.example.filemanager.domain.vfs.ChunkedRandomAccess
 import com.example.filemanager.domain.vfs.FileSystemProvider
@@ -11,7 +12,11 @@ import java.io.FileNotFoundException
 import java.io.IOException
 import java.io.InputStream
 import java.io.OutputStream
+import java.io.PrintWriter
 import java.net.URI
+import java.net.SocketException
+import java.net.URLDecoder
+import java.nio.charset.StandardCharsets
 import java.util.concurrent.CancellationException
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
@@ -19,9 +24,11 @@ import kotlinx.coroutines.flow.Flow
 import kotlinx.coroutines.flow.flow
 import kotlinx.coroutines.flow.flowOn
 import kotlinx.coroutines.withContext
+import org.apache.commons.net.PrintCommandListener
 import org.apache.commons.net.ftp.FTP
 import org.apache.commons.net.ftp.FTPClient
 import org.apache.commons.net.ftp.FTPFile
+import org.apache.commons.net.ftp.FTPReply
 
 /**
  * FTP Provider：处理 ftp:// scheme。
@@ -239,18 +246,115 @@ internal class FtpFileSystemProvider(
         override fun open(uri: URI): FtpSession {
             val host = uri.host ?: throw IllegalArgumentException("FTP URI missing host: $uri")
             val port = if (uri.port > 0) uri.port else 21
-            val (user, pass) = parseUserInfo(uri.userInfo)
+            // 注意：java.net.URI 的 userInfo 可能是 decode 后的；为排查 `@` / `%xx` 等字符导致的截断，优先取 rawUserInfo。
+            val rawUserInfo = uri.rawUserInfo ?: uri.userInfo
+            val (user, pass) = parseUserInfo(rawUserInfo)
             val client = FTPClient().apply {
                 connectTimeout = 5_000
                 defaultTimeout = 5_000
             }
-            client.connect(host, port)
-            val loggedIn = client.login(user, pass)
-            if (!loggedIn) {
-                runCatching { client.disconnect() }
-                throw IOException("FTP login failed: user=$user uri=$uri")
+
+            if (Log.isLoggable(TAG, Log.DEBUG)) {
+                // 仅在本地测试场景输出明文密码，避免误把敏感信息打到线上日志。
+                val passForLog = if (host == "127.0.0.1" || host == "localhost") pass else "***len=${pass.length}"
+                Log.d(
+                    TAG,
+                    "FTP userInfo parsed: raw=$rawUserInfo decoded=${uri.userInfo} user=$user pass=$passForLog uri=${redactUri(uri)}",
+                )
             }
+
+            if (Log.isLoggable(TAG, Log.DEBUG)) {
+                Log.d(TAG, "FTP connect: host=$host port=$port user=$user uri=${redactUri(uri)}")
+            }
+
+            // 打印底层 FTP 交互（USER/PASS/PWD/... 以及服务端 reply）。
+            // 注意：会包含明文密码，仅用于问题定位；如需关闭可通过移除此 listener 或在此处加开关。
+            client.addProtocolCommandListener(
+                PrintCommandListener(
+                    PrintWriter(
+                        object : java.io.OutputStream() {
+                            override fun write(b: Int) {}
+                            override fun write(b: ByteArray, off: Int, len: Int) {
+                                val msg = String(b, off, len).trim()
+                                if (msg.isNotEmpty()) {
+                                    Log.d("FTP_TRAFFIC", msg)
+                                }
+                            }
+                        },
+                    ),
+                    true,
+                ),
+            )
+
+            try {
+                client.connect(host, port)
+            } catch (e: SocketException) {
+                val ex = FtpConnectRuntimeException(
+                    buildString {
+                        append("FTP connect SocketException: host=")
+                        append(host)
+                        append(" port=")
+                        append(port)
+                        append(" uri=")
+                        append(redactUri(uri))
+                        if (host == "127.0.0.1" || host == "localhost") {
+                            append(" (本地调试：真机访问 127.0.0.1 需要 adb reverse；例如 adb reverse tcp:2121 tcp:2121。也请确认 AndroidManifest 配置了 usesCleartextTraffic=true)")
+                        }
+                    },
+                    e,
+                )
+                Log.e(TAG, ex.message ?: "FTP connect SocketException", ex)
+                throw ex
+            } catch (e: IOException) {
+                val ex = FtpConnectRuntimeException(
+                    buildString {
+                        append("FTP connect IOException: host=")
+                        append(host)
+                        append(" port=")
+                        append(port)
+                        append(" uri=")
+                        append(redactUri(uri))
+                        if (host == "127.0.0.1" || host == "localhost") {
+                            append(" (本地调试：真机访问 127.0.0.1 需要 adb reverse；例如 adb reverse tcp:2121 tcp:2121。也请确认 AndroidManifest 配置了 usesCleartextTraffic=true)")
+                        }
+                    },
+                    e,
+                )
+                Log.e(TAG, ex.message ?: "FTP connect IOException", ex)
+                throw ex
+            }
+            client.soTimeout = 5_000
+
+            // 连接成功也需要检查欢迎语 reply code
+            val connectCode = client.replyCode
+            if (!FTPReply.isPositiveCompletion(connectCode)) {
+                val reply = client.replyString?.trim().orEmpty()
+                runCatching { client.disconnect() }
+                throw IOException("FTP connect failed: code=$connectCode reply=$reply uri=${redactUri(uri)}")
+            }
+
+            // 默认启用 PASV：本地调试/adb reverse 场景更容易工作
             client.enterLocalPassiveMode()
+            // PASV 响应的 IP 在 NAT/端口转发下可能不正确；关闭校验避免连接被拒
+            client.isRemoteVerificationEnabled = false
+
+            val loggedIn = runCatching { client.login(user, pass) }.getOrElse { t ->
+                val code = client.replyCode
+                val reply = client.replyString?.trim().orEmpty()
+                runCatching { client.disconnect() }
+                throw IOException(
+                    "FTP login exception: code=$code reply=$reply user=$user uri=${redactUri(uri)}",
+                    t,
+                )
+            }
+            if (!loggedIn) {
+                val code = client.replyCode
+                val reply = client.replyString?.trim().orEmpty()
+                runCatching { client.disconnect() }
+                // 将 code/reply 放在前面：即便 UI/日志截断，也更容易看到服务端真实报错（例如 530）。
+                throw IOException("FTP login failed: code=$code reply=$reply user=$user uri=${redactUri(uri)}")
+            }
+
             client.setFileType(FTP.BINARY_FILE_TYPE)
             return FtpSession(client)
         }
@@ -316,6 +420,8 @@ internal class FtpFileSystemProvider(
     companion object {
         const val SCHEME: String = "ftp"
 
+        private const val TAG: String = "FtpFileSystemProvider"
+
         private fun ftpPath(uri: URI): String {
             val p = uri.path.orEmpty()
             val normalized = if (p.isBlank()) "/" else p
@@ -327,11 +433,39 @@ internal class FtpFileSystemProvider(
             return URI(base.scheme, base.userInfo, base.host, base.port, normalized, null, null)
         }
 
-        private fun parseUserInfo(userInfo: String?): Pair<String, String> {
-            if (userInfo.isNullOrBlank()) return "anonymous" to "anonymous"
-            val user = userInfo.substringBefore(':')
-            val pass = userInfo.substringAfter(':', missingDelimiterValue = "")
-            return user to pass
+        private fun parseUserInfo(rawUserInfo: String?): Pair<String, String> {
+            if (rawUserInfo.isNullOrBlank()) return "anonymous" to "anonymous"
+
+            // 这里必须按“最多切两段”的方式拆分：user:password（password 里允许继续包含 ':'）。
+            // 同时保留 rawUserInfo（通常是 percent-encoded），再做 decode。
+            val parts = rawUserInfo.split(":", limit = 2)
+            val rawUser = parts.getOrNull(0).orEmpty()
+            val rawPass = parts.getOrNull(1).orEmpty()
+            return decodeUserInfoPart(rawUser) to decodeUserInfoPart(rawPass)
+        }
+
+        private fun decodeUserInfoPart(raw: String): String {
+            if (raw.isBlank()) return raw
+            // URLDecoder 会把 '+' 解释为空格，但在 URI userInfo 中 '+' 是合法字面量。
+            // 为避免误伤，先将 '+' 保护起来。
+            val safe = raw.replace("+", "%2B")
+            return runCatching { URLDecoder.decode(safe, StandardCharsets.UTF_8.name()) }
+                .getOrDefault(raw)
+        }
+
+        private fun redactUri(uri: URI): String {
+            val userInfo = uri.userInfo
+            val redactedUserInfo = when {
+                userInfo.isNullOrBlank() -> null
+                !userInfo.contains(':') -> userInfo
+                else -> userInfo.substringBefore(':') + ":***"
+            }
+            return URI(uri.scheme, redactedUserInfo, uri.host, uri.port, uri.path, null, null).toString()
         }
     }
+
+    private class FtpConnectRuntimeException(
+        message: String,
+        cause: Throwable,
+    ) : RuntimeException(message, cause)
 }

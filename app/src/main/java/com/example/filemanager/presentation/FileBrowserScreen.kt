@@ -1,11 +1,17 @@
 package com.example.filemanager.presentation
 
+import androidx.compose.animation.AnimatedVisibility
+import androidx.compose.animation.Crossfade
+import androidx.compose.animation.expandHorizontally
+import androidx.compose.animation.fadeIn
+import androidx.compose.animation.fadeOut
+import androidx.compose.animation.shrinkHorizontally
+import androidx.compose.animation.core.tween
 import androidx.compose.animation.core.FastOutSlowInEasing
 import androidx.compose.animation.core.RepeatMode
 import androidx.compose.animation.core.animateFloat
 import androidx.compose.animation.core.infiniteRepeatable
 import androidx.compose.animation.core.rememberInfiniteTransition
-import androidx.compose.animation.core.tween
 import androidx.compose.foundation.ExperimentalFoundationApi
 import androidx.compose.foundation.background
 import androidx.compose.foundation.combinedClickable
@@ -33,6 +39,7 @@ import androidx.compose.material.icons.filled.ContentCut
 import androidx.compose.material.icons.filled.CreateNewFolder
 import androidx.compose.material.icons.filled.Delete
 import androidx.compose.material.icons.filled.Description
+import androidx.compose.material.icons.filled.DoneAll
 import androidx.compose.material.icons.filled.ErrorOutline
 import androidx.compose.material.icons.filled.Folder
 import androidx.compose.material.icons.filled.FilterList
@@ -55,6 +62,7 @@ import androidx.compose.material3.CardDefaults
 import androidx.compose.material3.DropdownMenu
 import androidx.compose.material3.DropdownMenuItem
 import androidx.compose.material3.ExperimentalMaterial3Api
+import androidx.compose.material3.Checkbox
 import androidx.compose.material3.ElevatedCard
 import androidx.compose.material3.FloatingActionButton
 import androidx.compose.material3.Icon
@@ -71,7 +79,10 @@ import androidx.compose.material3.Text
 import androidx.compose.material3.TextButton
 import androidx.compose.material3.TopAppBar
 import androidx.compose.material3.TopAppBarDefaults
+import androidx.activity.compose.BackHandler
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.Immutable
+import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.collectAsState
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateListOf
@@ -92,11 +103,11 @@ import androidx.compose.ui.unit.Dp
 import androidx.compose.ui.unit.dp
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.ui.input.nestedscroll.nestedScroll
-import androidx.compose.ui.semantics.semantics
+import androidx.compose.foundation.layout.WindowInsets
+import androidx.compose.foundation.text.BasicTextField
+import androidx.compose.ui.graphics.SolidColor
 import java.net.URI
-import java.text.SimpleDateFormat
-import java.util.Date
-import java.util.Locale
+import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
 
 private val FolderBlue = Color(0xFF007AFF)
@@ -111,7 +122,6 @@ private val IosGroupedBackground = Color(0xFFF2F2F7)
 private val IosGroupedBorder = Color(0xFFE5E5EA)
 
 private enum class MainTab(val label: String, val icon: ImageVector) {
-    Recent(label = "最近", icon = Icons.Filled.History),
     Browse(label = "浏览", icon = Icons.Filled.Folder),
     Network(label = "网络", icon = Icons.Filled.Public),
 }
@@ -119,7 +129,6 @@ private enum class MainTab(val label: String, val icon: ImageVector) {
 private enum class NetworkProtocol(val label: String) {
     SMB("SMB"),
     FTP("FTP"),
-    NFS("NFS"),
 }
 
 private data class NetworkServerConfig(
@@ -136,9 +145,8 @@ private data class NetworkServerConfig(
     val remotePath: String,
 )
 
-private fun NetworkServerConfig.toRootUriOrNull(): URI? {
+private fun NetworkServerConfig.toRootUri(): URI {
     return when (protocol) {
-        NetworkProtocol.NFS -> null
         NetworkProtocol.FTP -> buildFtpRootUri(host, port, username, password, remotePath)
         NetworkProtocol.SMB -> buildSmbRootUri(host, port, domain, username, password, remotePath)
     }
@@ -166,7 +174,6 @@ private fun requireValidRootUri(uri: URI, protocol: NetworkProtocol) {
             require(!uri.host.isNullOrBlank()) { "SMB URI 缺少 host" }
             require(uri.path.orEmpty().trim('/').isNotBlank()) { "SMB URI 缺少 share/path" }
         }
-        NetworkProtocol.NFS -> Unit
     }
 }
 
@@ -181,6 +188,7 @@ fun FileBrowserScreen(
 ) {
     val state by viewModel.uiState.collectAsState()
     val prefs by viewModel.preferences.collectAsState()
+    val multiSelection by viewModel.multiSelection.collectAsState()
 
     var settingsVisible by remember { mutableStateOf(false) }
 
@@ -196,6 +204,7 @@ fun FileBrowserScreen(
     FileBrowserContent(
         state = state,
         preferences = prefs,
+        multiSelection = multiSelection,
         onGoBack = { viewModel.goBack() },
         onRefresh = { viewModel.refresh() },
         onPickSafDirectory = onPickSafDirectory,
@@ -212,10 +221,13 @@ fun FileBrowserScreen(
         onOpenDirectory = { viewModel.openDirectory(it) },
         onOpenAsText = { viewModel.openAsText(it) },
         onCreateFolder = { viewModel.createFolder(it) },
-        onDelete = { viewModel.delete(it) },
-        onRename = { uri, name -> viewModel.rename(uri, name) },
-        onCopy = { viewModel.copyToClipboard(it) },
-        onCut = { viewModel.cutToClipboard(it) },
+        onEnterMultiSelection = { viewModel.enterMultiSelection(it) },
+        onToggleSelection = { viewModel.toggleSelection(it) },
+        onExitMultiSelection = { viewModel.exitMultiSelection() },
+        onSelectAll = { viewModel.selectAllVisible() },
+        onCopySelected = { viewModel.copySelectedToClipboard() },
+        onCutSelected = { viewModel.cutSelectedToClipboard() },
+        onDeleteSelected = { viewModel.deleteSelected() },
         onDismissTextViewer = { viewModel.dismissTextViewer() },
         onSetRoot = { viewModel.setRoot(it) },
     )
@@ -226,6 +238,7 @@ fun FileBrowserScreen(
 fun FileBrowserContent(
     state: FileBrowserUiState,
     preferences: FileBrowserPreferences,
+    multiSelection: MultiSelectionState,
     onGoBack: () -> Unit,
     onRefresh: () -> Unit,
     onPickSafDirectory: () -> Unit,
@@ -242,10 +255,13 @@ fun FileBrowserContent(
     onOpenDirectory: (URI) -> Unit,
     onOpenAsText: (URI) -> Unit,
     onCreateFolder: (String) -> Unit,
-    onDelete: (URI) -> Unit,
-    onRename: (URI, String) -> Unit,
-    onCopy: (URI) -> Unit,
-    onCut: (URI) -> Unit,
+    onEnterMultiSelection: (URI) -> Unit,
+    onToggleSelection: (URI) -> Unit,
+    onExitMultiSelection: () -> Unit,
+    onSelectAll: () -> Unit,
+    onCopySelected: () -> Unit,
+    onCutSelected: () -> Unit,
+    onDeleteSelected: () -> Unit,
     onDismissTextViewer: () -> Unit,
     onSetRoot: (URI) -> Unit,
 ) {
@@ -265,10 +281,6 @@ fun FileBrowserContent(
     var createFolderDialog by remember { mutableStateOf(false) }
     var createFolderName by remember { mutableStateOf("") }
 
-    var pendingDelete by remember { mutableStateOf<URI?>(null) }
-    var pendingRename by remember { mutableStateOf<URI?>(null) }
-    var renameText by remember { mutableStateOf("") }
-
     var selectedTab by remember { mutableStateOf(MainTab.Browse) }
 
     val snackbarHostState = remember { SnackbarHostState() }
@@ -279,6 +291,15 @@ fun FileBrowserContent(
 
     var moreMenuExpanded by remember { mutableStateOf(false) }
     var sortMenuExpanded by remember { mutableStateOf(false) }
+
+    val inMultiSelection = multiSelection.enabled
+    if (inMultiSelection) {
+        BackHandler(enabled = true) {
+            onExitMultiSelection()
+        }
+    }
+
+    var batchDeleteDialogVisible by remember { mutableStateOf(false) }
 
     // Network tab: 服务器配置（当前为内存态，后续可接 DataStore/Room 持久化）。
     val savedServers = remember { mutableStateListOf<NetworkServerConfig>() }
@@ -299,7 +320,6 @@ fun FileBrowserContent(
         serverPort = when (protocol) {
             NetworkProtocol.SMB -> "445"
             NetworkProtocol.FTP -> "21"
-            NetworkProtocol.NFS -> "2049"
         }
         serverDomain = ""
         serverUser = ""
@@ -307,12 +327,11 @@ fun FileBrowserContent(
         serverRemotePath = when (protocol) {
             NetworkProtocol.SMB -> "public/"
             NetworkProtocol.FTP -> "/"
-            NetworkProtocol.NFS -> "/"
         }
         serverDialogVisible = true
     }
 
-    val isNetworkDir: Boolean = currentDir?.scheme == "smb" || currentDir?.scheme == "ftp" || currentDir?.scheme == "nfs"
+    val isNetworkDir: Boolean = currentDir?.scheme == "smb" || currentDir?.scheme == "ftp"
 
     val supportsFilter: Boolean =
         (selectedTab == MainTab.Browse && currentDir != null) || (selectedTab == MainTab.Network && isNetworkDir && currentDir != null)
@@ -321,189 +340,286 @@ fun FileBrowserContent(
 
     val topBarTitle = when (selectedTab) {
         MainTab.Browse -> currentDir?.let { friendlyTitleForBrowseDir(it) } ?: selectedTab.label
-        else -> selectedTab.label
+        MainTab.Network -> selectedTab.label
     }
 
     Scaffold(
         modifier = Modifier.nestedScroll(scrollBehavior.nestedScrollConnection),
         containerColor = MaterialTheme.colorScheme.background,
+        // Edge-to-edge + Material3 TopAppBar/NavigationBar 本身会处理 system bars。
+        // 这里把 Scaffold 的 contentWindowInsets 置零，避免重复 inset 计算与额外 padding/measure。
+        contentWindowInsets = WindowInsets(0, 0, 0, 0),
         snackbarHost = { SnackbarHost(hostState = snackbarHostState) },
         topBar = {
-            TopAppBar(
-                title = {
-                    Box(
-                        modifier = Modifier.fillMaxHeight(),
-                        contentAlignment = Alignment.CenterStart,
-                    ) {
-                        if (supportsFilter && preferences.isSearchExpanded) {
-                            androidx.compose.material3.OutlinedTextField(
-                                value = preferences.searchQuery,
-                                onValueChange = onSearchQueryChange,
-                                placeholder = { Text("搜索当前列表") },
-                                singleLine = true,
-                                trailingIcon = {
-                                    if (preferences.searchQuery.isNotBlank()) {
-                                        IconButton(onClick = onClearSearch) {
-                                            Icon(Icons.Filled.Close, contentDescription = "清空搜索")
-                                        }
-                                    }
-                                },
-                                modifier = Modifier
-                                    .fillMaxWidth()
-                                    .testTag("search_input"),
-                            )
-                        } else {
+            Crossfade(targetState = inMultiSelection, label = "topbar") { isMulti ->
+                if (isMulti) {
+                    TopAppBar(
+                        title = {
                             Text(
-                                text = topBarTitle,
+                                text = "已选择 ${multiSelection.selectedCount} 项",
                                 maxLines = 1,
                                 overflow = TextOverflow.Ellipsis,
                                 style = MaterialTheme.typography.titleLarge.copy(fontWeight = FontWeight.SemiBold),
                             )
-                        }
-                    }
-                },
-                navigationIcon = {
-                    if ((selectedTab == MainTab.Browse || (selectedTab == MainTab.Network && isNetworkDir)) && canGoBack) {
-                        IconButton(onClick = onGoBack) {
-                            Icon(Icons.AutoMirrored.Filled.ArrowBack, contentDescription = "返回")
-                        }
-                    }
-                },
-                actions = {
-                    Row(
-                        modifier = Modifier.fillMaxHeight(),
-                        verticalAlignment = Alignment.CenterVertically,
-                        horizontalArrangement = Arrangement.spacedBy(2.dp),
-                    ) {
-                        if (supportsFilter) {
-                            IconButton(onClick = onToggleSearch) {
-                                val icon = if (preferences.isSearchExpanded) Icons.Filled.Close else Icons.Filled.Search
-                                val cd = if (preferences.isSearchExpanded) "关闭搜索" else "搜索"
-                                Icon(icon, contentDescription = cd)
+                        },
+                        navigationIcon = {
+                            IconButton(onClick = onExitMultiSelection) {
+                                Icon(Icons.Filled.Close, contentDescription = "退出多选")
                             }
-
-                            Box {
-                                IconButton(onClick = { sortMenuExpanded = true }) {
-                                    Icon(Icons.Filled.FilterList, contentDescription = "排序")
-                                }
-                                DropdownMenu(
-                                    expanded = sortMenuExpanded,
-                                    onDismissRequest = { sortMenuExpanded = false },
-                                ) {
-                                    SortOption.entries.forEach { option ->
-                                        val suffix = if (preferences.sortOption == option) " ✓" else ""
-                                        DropdownMenuItem(
-                                            text = { Text(option.label + suffix) },
-                                            onClick = {
-                                                sortMenuExpanded = false
-                                                onSetSortOption(option)
-                                            },
-                                        )
-                                    }
-                                }
-                            }
-                        }
-
-                        Box {
-                            IconButton(onClick = { moreMenuExpanded = true }) {
-                                Icon(Icons.Filled.MoreVert, contentDescription = "更多")
-                            }
-                            DropdownMenu(
-                                expanded = moreMenuExpanded,
-                                onDismissRequest = { moreMenuExpanded = false },
+                        },
+                        actions = {
+                            Row(
+                                modifier = Modifier.fillMaxHeight(),
+                                verticalAlignment = Alignment.CenterVertically,
+                                horizontalArrangement = Arrangement.spacedBy(2.dp),
                             ) {
-                                if (selectedTab == MainTab.Browse) {
-                                    if (!hasAllFilesAccess) {
-                                        DropdownMenuItem(
-                                            text = { Text("开启全盘访问") },
-                                            leadingIcon = { Icon(Icons.Filled.Security, contentDescription = null) },
-                                            onClick = {
-                                                moreMenuExpanded = false
-                                                onRequestAllFilesAccess()
-                                            },
-                                        )
-                                    }
-                                    if (clipboard != null) {
-                                        DropdownMenuItem(
-                                            text = { Text("粘贴") },
-                                            leadingIcon = { Icon(Icons.Filled.Save, contentDescription = null) },
-                                            onClick = {
-                                                moreMenuExpanded = false
-                                                onPasteIntoCurrentDir()
-                                            },
-                                        )
-                                        DropdownMenuItem(
-                                            text = { Text("清空剪贴板") },
-                                            leadingIcon = { Icon(Icons.Filled.Close, contentDescription = null) },
-                                            onClick = {
-                                                moreMenuExpanded = false
-                                                onClearClipboard()
-                                            },
-                                        )
-                                    }
-                                    DropdownMenuItem(
-                                        text = { Text("刷新") },
-                                        leadingIcon = { Icon(Icons.Filled.Refresh, contentDescription = null) },
-                                        onClick = {
-                                            moreMenuExpanded = false
-                                            onRefresh()
-                                        },
-                                    )
-                                    DropdownMenuItem(
-                                        text = { Text("回到本地") },
-                                        leadingIcon = { Icon(Icons.Filled.Folder, contentDescription = null) },
-                                        onClick = {
-                                            moreMenuExpanded = false
-                                            onGoLocalRoot()
-                                        },
-                                    )
-                                } else if (selectedTab == MainTab.Network) {
-                                    DropdownMenuItem(
-                                        text = { Text("添加服务器") },
-                                        leadingIcon = { Icon(Icons.Filled.Add, contentDescription = null) },
-                                        onClick = {
-                                            moreMenuExpanded = false
-                                            openServerDialog(NetworkProtocol.SMB)
-                                        },
-                                    )
-                                    if (isNetworkDir) {
-                                        DropdownMenuItem(
-                                            text = { Text("返回网络主页") },
-                                            onClick = {
-                                                moreMenuExpanded = false
-                                                // 当前阶段：Network Tab 主页只影响展示逻辑；目录仍保留在状态里。
-                                                showSnack("网络主页：占位")
-                                            },
-                                        )
-                                    }
-                                } else {
-                                    DropdownMenuItem(
-                                        text = { Text("暂无更多操作") },
-                                        onClick = {
-                                            moreMenuExpanded = false
-                                            showSnack("更多：占位")
-                                        },
+                                IconButton(onClick = onSelectAll) {
+                                    Icon(Icons.Filled.DoneAll, contentDescription = "全选")
+                                }
+                                IconButton(onClick = onCopySelected) {
+                                    Icon(Icons.Filled.ContentCopy, contentDescription = "复制")
+                                }
+                                IconButton(onClick = onCutSelected) {
+                                    Icon(Icons.Filled.ContentCut, contentDescription = "剪切")
+                                }
+                                IconButton(onClick = { batchDeleteDialogVisible = true }) {
+                                    Icon(Icons.Filled.Delete, contentDescription = "删除")
+                                }
+                            }
+                        },
+                        scrollBehavior = scrollBehavior,
+                        colors = TopAppBarDefaults.topAppBarColors(
+                            containerColor = MaterialTheme.colorScheme.primaryContainer,
+                            scrolledContainerColor = MaterialTheme.colorScheme.primaryContainer,
+                        ),
+                    )
+                } else {
+                    TopAppBar(
+                        title = {
+                            val showSearch = supportsFilter && preferences.isSearchExpanded
+                            // 搜索框和标题并排：宽度天然受左右按钮约束，同时保持标题可见不被遮挡。
+                            Row(
+                                modifier = Modifier
+                                    .fillMaxHeight()
+                                    .fillMaxWidth(),
+                                verticalAlignment = Alignment.CenterVertically,
+                            ) {
+                                Text(
+                                    text = topBarTitle,
+                                    maxLines = 1,
+                                    overflow = TextOverflow.Ellipsis,
+                                    style = MaterialTheme.typography.titleLarge.copy(fontWeight = FontWeight.SemiBold),
+                                    modifier = Modifier.padding(end = 8.dp),
+                                )
+
+                                AnimatedVisibility(
+                                    visible = showSearch,
+                                    modifier = Modifier.weight(1f),
+                                    enter = fadeIn(animationSpec = tween(160)) + expandHorizontally(
+                                        animationSpec = tween(220),
+                                        expandFrom = Alignment.End,
+                                    ),
+                                    exit = fadeOut(animationSpec = tween(120)) + shrinkHorizontally(
+                                        animationSpec = tween(180),
+                                        shrinkTowards = Alignment.End,
+                                    ),
+                                ) {
+                                    BasicTextField(
+                                        value = preferences.searchQuery,
+                                        onValueChange = onSearchQueryChange,
+                                        singleLine = true,
+                                        textStyle = MaterialTheme.typography.bodyLarge.copy(
+                                            color = MaterialTheme.colorScheme.onSurface
+                                        ),
+                                        cursorBrush = SolidColor(MaterialTheme.colorScheme.primary),
+                                        modifier = Modifier
+                                            .fillMaxWidth()
+                                            .height(36.dp)
+                                            .background(
+                                                color = Color.LightGray.copy(alpha = 0.3f),
+                                                shape = RoundedCornerShape(18.dp)
+                                            )
+                                            .testTag("search_input"),
+                                        decorationBox = { innerTextField ->
+                                            Row(
+                                                modifier = Modifier
+                                                    .fillMaxSize()
+                                                    .padding(horizontal = 12.dp),
+                                                verticalAlignment = Alignment.CenterVertically
+                                            ) {
+                                                Box(modifier = Modifier.weight(1f)) {
+                                                    if (preferences.searchQuery.isEmpty()) {
+                                                        Text(
+                                                            text = "搜索",
+                                                            color = MaterialTheme.colorScheme.onSurfaceVariant.copy(alpha = 0.6f),
+                                                            style = MaterialTheme.typography.bodyLarge
+                                                        )
+                                                    }
+                                                    innerTextField()
+                                                }
+                                                if (preferences.searchQuery.isNotBlank()) {
+                                                    IconButton(
+                                                        onClick = onClearSearch,
+                                                        modifier = Modifier.size(24.dp)
+                                                    ) {
+                                                        Icon(
+                                                            Icons.Filled.Close,
+                                                            contentDescription = "清空搜索",
+                                                            modifier = Modifier.size(16.dp),
+                                                            tint = MaterialTheme.colorScheme.onSurfaceVariant
+                                                        )
+                                                    }
+                                                }
+                                            }
+                                        }
                                     )
                                 }
-
-                                DropdownMenuItem(
-                                    text = { Text("设置") },
-                                    leadingIcon = { Icon(Icons.Filled.Settings, contentDescription = null) },
-                                    onClick = {
-                                        moreMenuExpanded = false
-                                        onOpenSettings()
-                                    },
-                                )
                             }
-                        }
-                    }
-                },
-                scrollBehavior = scrollBehavior,
-                colors = TopAppBarDefaults.topAppBarColors(
-                    containerColor = MaterialTheme.colorScheme.background,
-                    scrolledContainerColor = MaterialTheme.colorScheme.background,
-                ),
-            )
+                        },
+                        navigationIcon = {
+                            if ((selectedTab == MainTab.Browse || (selectedTab == MainTab.Network && isNetworkDir)) && canGoBack) {
+                                IconButton(onClick = onGoBack) {
+                                    Icon(Icons.AutoMirrored.Filled.ArrowBack, contentDescription = "返回")
+                                }
+                            }
+                        },
+                        actions = {
+                            Row(
+                                modifier = Modifier.fillMaxHeight(),
+                                verticalAlignment = Alignment.CenterVertically,
+                                horizontalArrangement = Arrangement.spacedBy(2.dp),
+                            ) {
+                                if (supportsFilter) {
+                                    IconButton(onClick = onToggleSearch) {
+                                        val icon = if (preferences.isSearchExpanded) Icons.Filled.Close else Icons.Filled.Search
+                                        val cd = if (preferences.isSearchExpanded) "关闭搜索" else "搜索"
+                                        Icon(icon, contentDescription = cd)
+                                    }
+
+                                    Box {
+                                        IconButton(onClick = { sortMenuExpanded = true }) {
+                                            Icon(Icons.Filled.FilterList, contentDescription = "排序")
+                                        }
+                                        DropdownMenu(
+                                            expanded = sortMenuExpanded,
+                                            onDismissRequest = { sortMenuExpanded = false },
+                                        ) {
+                                            SortOption.entries.forEach { option ->
+                                                val suffix = if (preferences.sortOption == option) " ✓" else ""
+                                                DropdownMenuItem(
+                                                    text = { Text(option.label + suffix) },
+                                                    onClick = {
+                                                        sortMenuExpanded = false
+                                                        onSetSortOption(option)
+                                                    },
+                                                )
+                                            }
+                                        }
+                                    }
+                                }
+
+                                Box {
+                                    IconButton(onClick = { moreMenuExpanded = true }) {
+                                        Icon(Icons.Filled.MoreVert, contentDescription = "更多")
+                                    }
+                                    DropdownMenu(
+                                        expanded = moreMenuExpanded,
+                                        onDismissRequest = { moreMenuExpanded = false },
+                                    ) {
+                                        if (selectedTab == MainTab.Browse) {
+                                            if (!hasAllFilesAccess) {
+                                                DropdownMenuItem(
+                                                    text = { Text("开启全盘访问") },
+                                                    leadingIcon = { Icon(Icons.Filled.Security, contentDescription = null) },
+                                                    onClick = {
+                                                        moreMenuExpanded = false
+                                                        onRequestAllFilesAccess()
+                                                    },
+                                                )
+                                            }
+                                            if (clipboard != null) {
+                                                DropdownMenuItem(
+                                                    text = { Text("粘贴") },
+                                                    leadingIcon = { Icon(Icons.Filled.Save, contentDescription = null) },
+                                                    onClick = {
+                                                        moreMenuExpanded = false
+                                                        onPasteIntoCurrentDir()
+                                                    },
+                                                )
+                                                DropdownMenuItem(
+                                                    text = { Text("清空剪贴板") },
+                                                    leadingIcon = { Icon(Icons.Filled.Close, contentDescription = null) },
+                                                    onClick = {
+                                                        moreMenuExpanded = false
+                                                        onClearClipboard()
+                                                    },
+                                                )
+                                            }
+                                            DropdownMenuItem(
+                                                text = { Text("刷新") },
+                                                leadingIcon = { Icon(Icons.Filled.Refresh, contentDescription = null) },
+                                                onClick = {
+                                                    moreMenuExpanded = false
+                                                    onRefresh()
+                                                },
+                                            )
+                                            DropdownMenuItem(
+                                                text = { Text("回到本地") },
+                                                leadingIcon = { Icon(Icons.Filled.Folder, contentDescription = null) },
+                                                onClick = {
+                                                    moreMenuExpanded = false
+                                                    onGoLocalRoot()
+                                                },
+                                            )
+                                        } else if (selectedTab == MainTab.Network) {
+                                            DropdownMenuItem(
+                                                text = { Text("添加服务器") },
+                                                leadingIcon = { Icon(Icons.Filled.Add, contentDescription = null) },
+                                                onClick = {
+                                                    moreMenuExpanded = false
+                                                    openServerDialog(NetworkProtocol.SMB)
+                                                },
+                                            )
+                                            if (isNetworkDir) {
+                                                DropdownMenuItem(
+                                                    text = { Text("返回网络主页") },
+                                                    onClick = {
+                                                        moreMenuExpanded = false
+                                                        // 当前阶段：Network Tab 主页只影响展示逻辑；目录仍保留在状态里。
+                                                        showSnack("网络主页：占位")
+                                                    },
+                                                )
+                                            }
+                                        } else {
+                                            DropdownMenuItem(
+                                                text = { Text("暂无更多操作") },
+                                                onClick = {
+                                                    moreMenuExpanded = false
+                                                    showSnack("更多：占位")
+                                                },
+                                            )
+                                        }
+
+                                        DropdownMenuItem(
+                                            text = { Text("设置") },
+                                            leadingIcon = { Icon(Icons.Filled.Settings, contentDescription = null) },
+                                            onClick = {
+                                                moreMenuExpanded = false
+                                                onOpenSettings()
+                                            },
+                                        )
+                                    }
+                                }
+                            }
+                        },
+                        scrollBehavior = scrollBehavior,
+                        colors = TopAppBarDefaults.topAppBarColors(
+                            containerColor = MaterialTheme.colorScheme.background,
+                            scrolledContainerColor = MaterialTheme.colorScheme.background,
+                        ),
+                    )
+                }
+            }
         },
         floatingActionButton = {
             when (selectedTab) {
@@ -526,7 +642,6 @@ fun FileBrowserContent(
                         Icon(Icons.Filled.Add, contentDescription = "添加服务器")
                     }
                 }
-                else -> Unit
             }
         },
         bottomBar = {
@@ -575,21 +690,23 @@ fun FileBrowserContent(
 
                                     items(
                                         items = entries,
-                                        key = { it.uri.toString() },
+                                        key = { it.uri },
+                                        contentType = { if (it.isDirectory) "dir" else "file" },
                                     ) { item ->
+                                        val selected = item.uri in multiSelection.selectedUris
                                         FlatFileRow(
                                             item = item,
+                                            selectionMode = inMultiSelection,
+                                            selected = selected,
                                             onClick = {
-                                                if (item.isDirectory) onOpenDirectory(item.uri)
-                                                else onOpenAsText(item.uri)
+                                                if (inMultiSelection) {
+                                                    onToggleSelection(item.uri)
+                                                } else {
+                                                    if (item.isDirectory) onOpenDirectory(item.uri)
+                                                    else onOpenAsText(item.uri)
+                                                }
                                             },
-                                            onDelete = { pendingDelete = item.uri },
-                                            onRename = {
-                                                pendingRename = item.uri
-                                                renameText = item.name
-                                            },
-                                            onCopy = { onCopy(item.uri) },
-                                            onCut = { onCut(item.uri) },
+                                            onLongClick = { onEnterMultiSelection(item.uri) },
                                         )
                                     }
                                     item { Spacer(modifier = Modifier.height(80.dp)) }
@@ -616,10 +733,6 @@ fun FileBrowserContent(
                     }
                 }
 
-                MainTab.Recent -> {
-                    SimplePlaceholderScreen(title = "最近")
-                }
-
                 MainTab.Network -> {
                     if (isNetworkDir && currentDir != null) {
                         when (state) {
@@ -640,21 +753,23 @@ fun FileBrowserContent(
                                     }
                                     items(
                                         items = entries,
-                                        key = { it.uri.toString() },
+                                        key = { it.uri },
+                                        contentType = { if (it.isDirectory) "dir" else "file" },
                                     ) { item ->
+                                        val selected = item.uri in multiSelection.selectedUris
                                         FlatFileRow(
                                             item = item,
+                                            selectionMode = inMultiSelection,
+                                            selected = selected,
                                             onClick = {
-                                                if (item.isDirectory) onOpenDirectory(item.uri)
-                                                else onOpenAsText(item.uri)
+                                                if (inMultiSelection) {
+                                                    onToggleSelection(item.uri)
+                                                } else {
+                                                    if (item.isDirectory) onOpenDirectory(item.uri)
+                                                    else onOpenAsText(item.uri)
+                                                }
                                             },
-                                            onDelete = { pendingDelete = item.uri },
-                                            onRename = {
-                                                pendingRename = item.uri
-                                                renameText = item.name
-                                            },
-                                            onCopy = { onCopy(item.uri) },
-                                            onCut = { onCut(item.uri) },
+                                            onLongClick = { onEnterMultiSelection(item.uri) },
                                         )
                                     }
                                     item { Spacer(modifier = Modifier.height(80.dp)) }
@@ -731,28 +846,6 @@ fun FileBrowserContent(
                                 }
                             }
 
-                            item {
-                                ElevatedCard(
-                                    onClick = { openServerDialog(NetworkProtocol.NFS) },
-                                    shape = RoundedCornerShape(14.dp),
-                                    colors = CardDefaults.elevatedCardColors(containerColor = MaterialTheme.colorScheme.surface),
-                                ) {
-                                    Row(
-                                        modifier = Modifier
-                                            .fillMaxWidth()
-                                            .padding(14.dp),
-                                        horizontalArrangement = Arrangement.SpaceBetween,
-                                        verticalAlignment = Alignment.CenterVertically,
-                                    ) {
-                                        Column {
-                                            Text("NFS", style = MaterialTheme.typography.bodyLarge)
-                                            Text("入口已就绪（协议实现待接入）", style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
-                                        }
-                                        Text("+", style = MaterialTheme.typography.titleLarge)
-                                    }
-                                }
-                            }
-
                             if (savedServers.isNotEmpty()) {
                                 item {
                                     Text(
@@ -767,11 +860,7 @@ fun FileBrowserContent(
                                 ) { cfg ->
                                     ElevatedCard(
                                         onClick = {
-                                            val uri = cfg.toRootUriOrNull()
-                                            if (uri == null) {
-                                                showSnack("NFS 暂未接入：仅保留配置框架")
-                                                return@ElevatedCard
-                                            }
+                                            val uri = cfg.toRootUri()
                                             onSetRoot(uri)
                                             showSnack("已连接：${cfg.protocol.label} ${cfg.host}")
                                         },
@@ -816,7 +905,6 @@ fun FileBrowserContent(
         val protocolTagPrefix = when (serverProtocol) {
             NetworkProtocol.SMB -> "smb"
             NetworkProtocol.FTP -> "ftp"
-            NetworkProtocol.NFS -> "nfs"
         }
 
         AlertDialog(
@@ -833,10 +921,6 @@ fun FileBrowserContent(
                             onClick = { openServerDialog(NetworkProtocol.FTP) },
                             modifier = Modifier.testTag("ftp_protocol_button"),
                         ) { Text("FTP") }
-                        TextButton(
-                            onClick = { openServerDialog(NetworkProtocol.NFS) },
-                            modifier = Modifier.testTag("nfs_protocol_button"),
-                        ) { Text("NFS") }
                     }
 
                     androidx.compose.material3.OutlinedTextField(
@@ -887,7 +971,6 @@ fun FileBrowserContent(
                     val pathLabel = when (serverProtocol) {
                         NetworkProtocol.SMB -> "共享路径（例如 public/Movies/）"
                         NetworkProtocol.FTP -> "初始目录（例如 / 或 /pub/）"
-                        NetworkProtocol.NFS -> "导出路径（例如 /export/）"
                     }
                     androidx.compose.material3.OutlinedTextField(
                         value = serverRemotePath,
@@ -909,7 +992,6 @@ fun FileBrowserContent(
                                 when (serverProtocol) {
                                     NetworkProtocol.SMB -> ""
                                     NetworkProtocol.FTP -> "/"
-                                    NetworkProtocol.NFS -> "/"
                                 }
                             }
                             if (serverProtocol == NetworkProtocol.SMB && remotePath.trimStart('/').isBlank()) {
@@ -930,11 +1012,7 @@ fun FileBrowserContent(
 
                             if (!savedServers.contains(cfg)) savedServers.add(cfg)
 
-                            val uri = cfg.toRootUriOrNull()
-                            if (uri == null) {
-                                showSnack("NFS 暂未接入：仅保留配置框架")
-                                return@runCatching
-                            }
+                            val uri = cfg.toRootUri()
                             requireValidRootUri(uri, serverProtocol)
 
                             // 先关闭弹窗，避免网络请求/加载耗时导致 UI 看起来“卡住”。
@@ -989,51 +1067,21 @@ fun FileBrowserContent(
         )
     }
 
-    pendingDelete?.let { uri ->
+    if (batchDeleteDialogVisible && inMultiSelection) {
         AlertDialog(
-            onDismissRequest = { pendingDelete = null },
-            title = { Text("删除") },
-            text = { Text("确定删除该项吗？\n$uri") },
+            onDismissRequest = { batchDeleteDialogVisible = false },
+            title = { Text("批量删除") },
+            text = { Text("确定删除已选择 ${multiSelection.selectedCount} 项吗？") },
             confirmButton = {
                 TextButton(
                     onClick = {
-                        pendingDelete = null
-                        onDelete(uri)
+                        batchDeleteDialogVisible = false
+                        onDeleteSelected()
                     },
                 ) { Text("删除") }
             },
             dismissButton = {
-                TextButton(onClick = { pendingDelete = null }) { Text("取消") }
-            },
-        )
-    }
-
-    pendingRename?.let { uri ->
-        AlertDialog(
-            onDismissRequest = { pendingRename = null },
-            title = { Text("重命名") },
-            text = {
-                Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
-                    androidx.compose.material3.OutlinedTextField(
-                        value = renameText,
-                        onValueChange = { renameText = it },
-                        label = { Text("新名称") },
-                        singleLine = true,
-                    )
-                    Text(text = uri.toString(), maxLines = 2, overflow = TextOverflow.Ellipsis)
-                }
-            },
-            confirmButton = {
-                TextButton(
-                    onClick = {
-                        pendingRename = null
-                        val name = renameText.trim()
-                        if (name.isNotBlank()) onRename(uri, name)
-                    },
-                ) { Text("确定") }
-            },
-            dismissButton = {
-                TextButton(onClick = { pendingRename = null }) { Text("取消") }
+                TextButton(onClick = { batchDeleteDialogVisible = false }) { Text("取消") }
             },
         )
     }
@@ -1060,26 +1108,44 @@ fun FileBrowserContent(
 @OptIn(ExperimentalFoundationApi::class)
 private fun FlatFileRow(
     item: FileEntryUi,
+    selectionMode: Boolean,
+    selected: Boolean,
     onClick: () -> Unit,
-    onRename: () -> Unit,
-    onDelete: () -> Unit,
-    onCopy: () -> Unit,
-    onCut: () -> Unit,
+    onLongClick: () -> Unit,
 ) {
-    var menuExpanded by remember { mutableStateOf(false) }
+    val defaultFileTint = MaterialTheme.colorScheme.onSurfaceVariant
+    val iconStyle = remember(item.isDirectory, item.name, defaultFileTint) {
+        fileIconStyleFor(item = item, defaultFileTint = defaultFileTint)
+    }
 
-    val iconStyle = fileIconStyleFor(item)
+    val selectedBg = MaterialTheme.colorScheme.primaryContainer.copy(alpha = 0.6f)
+    val rowBg = if (selected) selectedBg else Color.Transparent
+
+    // 某些设备/注入事件（例如 adb swipe 模拟长按）可能在触发 long press 后仍回落触发一次 click。
+    // 这里显式屏蔽“紧随长按后的那一次 click”，避免长按进入多选后又立刻执行打开文件/进入目录。
+    var ignoreNextClickAfterLongPress by remember(item.uri) { mutableStateOf(false) }
+    LaunchedEffect(ignoreNextClickAfterLongPress) {
+        if (ignoreNextClickAfterLongPress) {
+            // 只需要覆盖同一次手势内（长按抬起时）的 click 回调。
+            delay(150)
+            ignoreNextClickAfterLongPress = false
+        }
+    }
 
     Row(
         modifier = Modifier
             .fillMaxWidth()
+            .background(color = rowBg, shape = RoundedCornerShape(14.dp))
             .combinedClickable(
-                onClick = onClick,
-                onLongClick = { menuExpanded = true },
+                onClick = {
+                    if (!ignoreNextClickAfterLongPress) onClick()
+                },
+                onLongClick = {
+                    ignoreNextClickAfterLongPress = true
+                    onLongClick()
+                },
             )
-            // 让「点击」语义与子节点文本合并，便于 Robolectric/Compose UI Test 通过 text + clickAction 精准定位。
-            .semantics(mergeDescendants = true) {}
-            .padding(vertical = 14.dp),
+            .padding(horizontal = 12.dp, vertical = 14.dp),
         verticalAlignment = Alignment.CenterVertically,
         horizontalArrangement = Arrangement.spacedBy(14.dp),
     ) {
@@ -1092,90 +1158,37 @@ private fun FlatFileRow(
 
         Column(modifier = Modifier.weight(1f)) {
             Text(
-                text = item.name,
-                maxLines = 1,
+                text = item.displayName,
+                maxLines = 2,
                 overflow = TextOverflow.Ellipsis,
                 color = MaterialTheme.colorScheme.onBackground,
-                style = MaterialTheme.typography.bodyLarge,
+                style = MaterialTheme.typography.bodyLarge.copy(
+                    lineBreak = androidx.compose.ui.text.style.LineBreak.Simple
+                ),
             )
-            val subtitle = buildString {
-                append(if (item.isDirectory) "目录" else "${item.size} B")
-                val time = formatLastModified(item.lastModified)
-                if (time.isNotBlank()) {
-                    append(" · ")
-                    append(time)
-                }
-            }
             Text(
-                text = subtitle,
+                text = item.subtitle,
                 style = MaterialTheme.typography.bodySmall,
                 color = MaterialTheme.colorScheme.onSurfaceVariant,
             )
         }
 
-        // 右侧不再显示“向右箭头”指示器；保留一个极小的锚点用于 DropdownMenu 定位。
-        Box(modifier = Modifier.size(1.dp)) {
-            DropdownMenu(expanded = menuExpanded, onDismissRequest = { menuExpanded = false }) {
-                DropdownMenuItem(
-                    text = { Text("复制") },
-                    leadingIcon = { Icon(Icons.Filled.ContentCopy, contentDescription = null) },
-                    onClick = {
-                        menuExpanded = false
-                        onCopy()
-                    },
-                )
-                DropdownMenuItem(
-                    text = { Text("剪切") },
-                    leadingIcon = { Icon(Icons.Filled.ContentCut, contentDescription = null) },
-                    onClick = {
-                        menuExpanded = false
-                        onCut()
-                    },
-                )
-                DropdownMenuItem(
-                    text = { Text("重命名") },
-                    leadingIcon = { Icon(Icons.AutoMirrored.Filled.TextSnippet, contentDescription = null) },
-                    onClick = {
-                        menuExpanded = false
-                        onRename()
-                    },
-                )
-                DropdownMenuItem(
-                    text = { Text("删除") },
-                    leadingIcon = { Icon(Icons.Filled.Delete, contentDescription = null) },
-                    onClick = {
-                        menuExpanded = false
-                        onDelete()
-                    },
-                )
-            }
+        if (selectionMode) {
+            Checkbox(
+                checked = selected,
+                onCheckedChange = { onClick() },
+            )
         }
     }
 }
 
-@Composable
-private fun SimplePlaceholderScreen(title: String) {
-    Box(
-        modifier = Modifier
-            .fillMaxSize()
-            .padding(24.dp),
-        contentAlignment = Alignment.Center,
-    ) {
-        Text(
-            text = "$title（待实现）",
-            style = MaterialTheme.typography.titleMedium,
-            color = MaterialTheme.colorScheme.onSurfaceVariant,
-        )
-    }
-}
-
+@Immutable
 private data class FileIconStyle(
     val icon: ImageVector,
     val tint: Color,
 )
 
-@Composable
-private fun fileIconStyleFor(item: FileEntryUi): FileIconStyle {
+private fun fileIconStyleFor(item: FileEntryUi, defaultFileTint: Color): FileIconStyle {
     if (item.isDirectory) {
         return FileIconStyle(icon = Icons.Filled.Folder, tint = FolderBlue)
     }
@@ -1189,7 +1202,7 @@ private fun fileIconStyleFor(item: FileEntryUi): FileIconStyle {
         ext == "pdf" -> FileIconStyle(icon = Icons.Filled.PictureAsPdf, tint = DocumentGreen)
         ext == "apk" -> FileIconStyle(icon = Icons.Filled.Android, tint = ApkTeal)
         ext in textExtensions -> FileIconStyle(icon = Icons.AutoMirrored.Filled.TextSnippet, tint = DocumentGreen)
-        else -> FileIconStyle(icon = Icons.Filled.Description, tint = MaterialTheme.colorScheme.onSurfaceVariant)
+        else -> FileIconStyle(icon = Icons.Filled.Description, tint = defaultFileTint)
     }
 }
 
@@ -1307,14 +1320,6 @@ private fun buildSmbRootUri(
     val p1 = "/$raw"
     val path = if (p1.endsWith('/')) p1 else "$p1/"
     return URI("smb", userInfo, host, port ?: -1, path, null, null)
-}
-
-private fun formatLastModified(epochMillis: Long): String {
-    if (epochMillis <= 0L) return ""
-    return runCatching {
-        val fmt = SimpleDateFormat("yyyy-MM-dd HH:mm", Locale.getDefault())
-        fmt.format(Date(epochMillis))
-    }.getOrDefault("")
 }
 
 @Composable
@@ -1489,6 +1494,7 @@ private fun SettingsScreen(
     val scrollBehavior = TopAppBarDefaults.pinnedScrollBehavior()
     Scaffold(
         modifier = Modifier.nestedScroll(scrollBehavior.nestedScrollConnection),
+        contentWindowInsets = WindowInsets(0, 0, 0, 0),
         topBar = {
             TopAppBar(
                 title = { Text("设置") },
