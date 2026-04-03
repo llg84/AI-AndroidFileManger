@@ -10,8 +10,11 @@ import android.provider.Settings
 import androidx.activity.ComponentActivity
 import androidx.activity.compose.setContent
 import androidx.activity.enableEdgeToEdge
+import androidx.compose.foundation.isSystemInDarkTheme
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.Surface
+import androidx.compose.material3.darkColorScheme
+import androidx.compose.material3.lightColorScheme
 import androidx.compose.runtime.DisposableEffect
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
@@ -25,6 +28,7 @@ import androidx.lifecycle.Lifecycle
 import androidx.lifecycle.LifecycleEventObserver
 import androidx.lifecycle.compose.LocalLifecycleOwner
 import androidx.lifecycle.viewmodel.compose.viewModel
+import androidx.compose.ui.graphics.Color
 import com.example.filemanager.data.vfs.VfsManager
 import java.net.URI
 
@@ -37,8 +41,11 @@ class MainActivity : ComponentActivity() {
         val vfs = VfsManager.createDefault(applicationContext)
 
         setContent {
-                    MaterialTheme {
-                        Surface {
+            // “屠紫”行动：禁用 Dynamic Color（不使用 dynamic*ColorScheme），并强制使用极客灰阶配色。
+            val colorScheme = if (isSystemInDarkTheme()) GeekDarkColorScheme else GeekLightColorScheme
+
+            MaterialTheme(colorScheme = colorScheme) {
+                Surface(color = colorScheme.background) {
                     val vm: FileBrowserViewModel = viewModel(factory = FileBrowserViewModelFactory(vfs, prefs))
 
                     val lifecycleOwner = LocalLifecycleOwner.current
@@ -147,3 +154,48 @@ private const val PREFS_NAME = "file_manager_prefs"
 private const val PREF_KEY_SAF_ROOT = "saf_root_uri"
 
 internal const val EXTRA_E2E_USE_INTERNAL_ROOT = "e2e_use_internal_root"
+
+// 纯灰阶/淡灰：确保 primary/secondary/containers 等不再出现默认 Material3 紫色。
+private val GeekLightColorScheme = lightColorScheme(
+    primary = Color(0xFF4A4A4A),
+    onPrimary = Color.White,
+    primaryContainer = Color(0xFFE2E2E2),
+    onPrimaryContainer = Color(0xFF111111),
+    secondary = Color(0xFF616161),
+    onSecondary = Color.White,
+    secondaryContainer = Color(0xFFDADADA),
+    onSecondaryContainer = Color(0xFF111111),
+    tertiary = Color(0xFF757575),
+    onTertiary = Color.White,
+    tertiaryContainer = Color(0xFFE6E6E6),
+    onTertiaryContainer = Color(0xFF111111),
+    background = Color(0xFFF5F5F5),
+    onBackground = Color(0xFF111111),
+    surface = Color(0xFFFFFFFF),
+    onSurface = Color(0xFF111111),
+    surfaceVariant = Color(0xFFEDEDED),
+    onSurfaceVariant = Color(0xFF444444),
+    outline = Color(0xFFB0B0B0),
+)
+
+private val GeekDarkColorScheme = darkColorScheme(
+    primary = Color(0xFFE0E0E0),
+    onPrimary = Color(0xFF111111),
+    primaryContainer = Color(0xFF2C2C2C),
+    onPrimaryContainer = Color(0xFFEDEDED),
+    secondary = Color(0xFFCCCCCC),
+    onSecondary = Color(0xFF111111),
+    secondaryContainer = Color(0xFF343434),
+    onSecondaryContainer = Color(0xFFEDEDED),
+    tertiary = Color(0xFFBDBDBD),
+    onTertiary = Color(0xFF111111),
+    tertiaryContainer = Color(0xFF3A3A3A),
+    onTertiaryContainer = Color(0xFFEDEDED),
+    background = Color(0xFF111111),
+    onBackground = Color(0xFFEDEDED),
+    surface = Color(0xFF1A1A1A),
+    onSurface = Color(0xFFEDEDED),
+    surfaceVariant = Color(0xFF2A2A2A),
+    onSurfaceVariant = Color(0xFFCCCCCC),
+    outline = Color(0xFF6E6E6E),
+)

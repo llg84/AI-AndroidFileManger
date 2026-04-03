@@ -10,6 +10,7 @@ import android.system.ErrnoException
 import android.system.OsConstants
 import com.example.filemanager.data.vfs.VfsManager
 import com.example.filemanager.domain.vfs.VirtualFile
+import java.io.File
 import java.net.URI
 import java.text.SimpleDateFormat
 import java.util.Date
@@ -30,7 +31,10 @@ data class FileEntryUi(
     val uri: URI,
     /** 原始文件名（用于重命名输入、后缀判断等）。 */
     val name: String,
-    /** 列表展示名：仅在必要时插入 \u200B，避免 Compose 重组时做字符串处理。 */
+    /**
+     * 列表展示名：为彻底解决中英文混排/长单词导致的异常提前换行，强制在每个字符之间插入 \u200B。
+     * 注意：仅用于 UI 展示；逻辑侧一律使用 [name]。
+     */
     val displayName: String,
     /** 列表副标题：包含类型/大小 + 预格式化时间字符串。 */
     val subtitle: String,
@@ -577,7 +581,18 @@ class FileBrowserViewModel(
         val parent = s.currentDir
         viewModelScope.launch {
             setDirStateLoading(dir = parent, canGoBack = s.canGoBack, clipboard = s.clipboard)
-            runCatching { vfs.createChildDirectory(parent, displayName) }
+            runCatching {
+                val name = displayName.trim()
+                require(name.isNotBlank()) { "文件夹名称不能为空" }
+
+                withContext(Dispatchers.IO) {
+                    if (parent.scheme == "file") {
+                        createLocalDirectoryUsingFile(parent, name)
+                    } else {
+                        vfs.createChildDirectory(parent, name)
+                    }
+                }
+            }
                 .onFailure { e ->
                     setDirStateError(parent, e.message ?: e.toString(), canGoBack = s.canGoBack, clipboard = s.clipboard)
                     return@launch
@@ -651,11 +666,8 @@ class FileBrowserViewModel(
                 val lastModified = runCatching { vf.lastModified() }.getOrDefault(0L)
                 val size = if (isDir) 0L else runCatching { vf.length() }.getOrDefault(0L)
 
-                val displayName = if (shouldInsertZwsForLineBreak(name)) {
-                    insertZeroWidthSpacesBetweenCodePoints(name)
-                } else {
-                    name
-                }
+                // 极客级“暴力”断行：把文件名变成「字符 + \u200B + 字符 + \u200B ...」，让 Compose 可在任意字符间断行。
+                val displayName = name.forceCharLineBreakForCompose()
 
                 val time = if (lastModified <= 0L) {
                     ""
@@ -667,7 +679,7 @@ class FileBrowserViewModel(
                 }
 
                 val subtitle = buildString {
-                    append(if (isDir) "目录" else "$size B")
+                    append(if (isDir) "目录" else formatFileSize(size))
                     if (time.isNotBlank()) {
                         append(" · ")
                         append(time)
@@ -788,33 +800,46 @@ class FileBrowserViewModelFactory(
 private const val PREF_KEY_SORT_OPTION = "sort_option"
 private const val PREF_KEY_SHOW_HIDDEN_FILES = "show_hidden_files"
 
-private fun shouldInsertZwsForLineBreak(name: String): Boolean {
-    // 只有在“超长连续字母/数字”导致 Text 过早/异常折行时才需要插入 \u200B。
-    // 常规文件名（短、含分隔符）不做处理，避免字符串膨胀与文本排版成本。
-    if (name.length < 32) return false
-
-    var run = 0
-    for (c in name) {
-        val isAsciiWord = (c in 'a'..'z') || (c in 'A'..'Z') || (c in '0'..'9')
-        if (isAsciiWord) {
-            run++
-            if (run >= 16) return true
-        } else {
-            run = 0
-        }
-    }
-    return false
+/**
+ * 在每个字符之间强制插入 \u200B（Zero Width Space）。
+ * 这样 Compose 的排版引擎会把长单词视作可拆分的单字符序列，从而避免“整段英文/混排提前换行”。
+ */
+private fun String.forceCharLineBreakForCompose(): String {
+    if (isEmpty()) return this
+    return this.toList().joinToString("\u200B")
 }
 
-private fun insertZeroWidthSpacesBetweenCodePoints(input: String): String {
-    // 在 code point 之间插入 \u200B（对 emoji/代理对安全）。
-    val sb = StringBuilder(input.length * 2)
-    var i = 0
-    while (i < input.length) {
-        val cp = input.codePointAt(i)
-        sb.appendCodePoint(cp)
-        i += Character.charCount(cp)
-        if (i < input.length) sb.append('\u200B')
+private fun createLocalDirectoryUsingFile(parentUri: URI, name: String) {
+    val parentFile = File(parentUri)
+    require(parentFile.isDirectory) { "目标不是本地目录：$parentUri" }
+    val target = File(parentFile, name)
+    if (target.exists()) {
+        throw IllegalStateException("已存在同名文件/文件夹：$name")
     }
-    return sb.toString()
+    if (!target.mkdir()) {
+        throw IllegalStateException("创建文件夹失败：$name")
+    }
+}
+
+private fun formatFileSize(bytes: Long): String {
+    val b = bytes.coerceAtLeast(0L)
+    if (b < 1024L) return "$b B"
+
+    // 仅按 1024 进制转换到 KB/MB/GB（大于等于 1GB 也按 GB 展示）。
+    val units = arrayOf("KB", "MB", "GB")
+    var value = b.toDouble()
+    var unitIndex = -1
+    while (value >= 1024.0 && unitIndex < units.lastIndex) {
+        value /= 1024.0
+        unitIndex++
+    }
+    val unit = units[unitIndex]
+
+    // 小于 10 时保留 1 位小数（例如 1.2 MB）；否则取整（例如 450 KB）。
+    val number = if (value < 10.0) {
+        String.format(Locale.ROOT, "%.1f", value).removeSuffix(".0")
+    } else {
+        String.format(Locale.ROOT, "%.0f", value)
+    }
+    return "$number $unit"
 }

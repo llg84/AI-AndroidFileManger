@@ -63,8 +63,8 @@ import androidx.compose.material3.DropdownMenu
 import androidx.compose.material3.DropdownMenuItem
 import androidx.compose.material3.ExperimentalMaterial3Api
 import androidx.compose.material3.Checkbox
+import androidx.compose.material3.CheckboxDefaults
 import androidx.compose.material3.ElevatedCard
-import androidx.compose.material3.FloatingActionButton
 import androidx.compose.material3.Icon
 import androidx.compose.material3.IconButton
 import androidx.compose.material3.ListItem
@@ -96,7 +96,9 @@ import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.Shape
 import androidx.compose.ui.graphics.vector.ImageVector
 import androidx.compose.ui.platform.testTag
+import androidx.compose.ui.text.TextStyle
 import androidx.compose.ui.text.font.FontWeight
+import androidx.compose.ui.text.style.LineBreak
 import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.Dp
@@ -113,13 +115,19 @@ import kotlinx.coroutines.launch
 private val FolderBlue = Color(0xFF007AFF)
 private val ImageOrange = Color(0xFFFF9500)
 private val DocumentGreen = Color(0xFF34C759)
+// “极客灰”只约束界面骨架与交互态；文件类型 Icon 仍保持高辨识度的彩色。
 private val VideoIndigo = Color(0xFF5856D6)
 private val AudioPurple = Color(0xFFAF52DE)
 private val ArchiveYellow = Color(0xFFFFCC00)
 private val ApkTeal = Color(0xFF32ADE6)
 
-private val IosGroupedBackground = Color(0xFFF2F2F7)
-private val IosGroupedBorder = Color(0xFFE5E5EA)
+// 纯灰（RGB 相等）：避免出现“淡紫/淡蓝”底色观感。
+private val IosGroupedBackground = Color(0xFFF2F2F2)
+private val IosGroupedBorder = Color(0xFFE5E5E5)
+
+// 去紫化：统一使用淡灰色作为“选中/多选模式”背景。
+private val GeekSelectionBackground = Color.LightGray.copy(alpha = 0.30f)
+private val GeekMultiTopBarBackground = Color.LightGray.copy(alpha = 0.50f)
 
 private enum class MainTab(val label: String, val icon: ImageVector) {
     Browse(label = "浏览", icon = Icons.Filled.Folder),
@@ -292,10 +300,14 @@ fun FileBrowserContent(
     var moreMenuExpanded by remember { mutableStateOf(false) }
     var sortMenuExpanded by remember { mutableStateOf(false) }
 
-    val inMultiSelection = multiSelection.enabled
-    if (inMultiSelection) {
-        BackHandler(enabled = true) {
-            onExitMultiSelection()
+    val inMultiSelection: Boolean = multiSelection.enabled || multiSelection.selectedUris.isNotEmpty()
+
+    BackHandler(enabled = inMultiSelection || canGoBack) {
+        when {
+            // 优先级 1：多选模式下返回键用于退出多选（清空选中）。
+            inMultiSelection -> onExitMultiSelection()
+            // 优先级 2：非根目录时返回上一级（等同左上角箭头）。
+            canGoBack -> onGoBack()
         }
     }
 
@@ -389,8 +401,8 @@ fun FileBrowserContent(
                         },
                         scrollBehavior = scrollBehavior,
                         colors = TopAppBarDefaults.topAppBarColors(
-                            containerColor = MaterialTheme.colorScheme.primaryContainer,
-                            scrolledContainerColor = MaterialTheme.colorScheme.primaryContainer,
+                            containerColor = GeekMultiTopBarBackground,
+                            scrolledContainerColor = GeekMultiTopBarBackground,
                         ),
                     )
                 } else {
@@ -527,6 +539,17 @@ fun FileBrowserContent(
                                         onDismissRequest = { moreMenuExpanded = false },
                                     ) {
                                         if (selectedTab == MainTab.Browse) {
+                                            if (currentDir != null) {
+                                                DropdownMenuItem(
+                                                    text = { Text("新建文件夹") },
+                                                    leadingIcon = { Icon(Icons.Filled.CreateNewFolder, contentDescription = null) },
+                                                    onClick = {
+                                                        moreMenuExpanded = false
+                                                        createFolderName = ""
+                                                        createFolderDialog = true
+                                                    },
+                                                )
+                                            }
                                             if (!hasAllFilesAccess) {
                                                 DropdownMenuItem(
                                                     text = { Text("开启全盘访问") },
@@ -563,23 +586,7 @@ fun FileBrowserContent(
                                                     onRefresh()
                                                 },
                                             )
-                                            DropdownMenuItem(
-                                                text = { Text("回到本地") },
-                                                leadingIcon = { Icon(Icons.Filled.Folder, contentDescription = null) },
-                                                onClick = {
-                                                    moreMenuExpanded = false
-                                                    onGoLocalRoot()
-                                                },
-                                            )
                                         } else if (selectedTab == MainTab.Network) {
-                                            DropdownMenuItem(
-                                                text = { Text("添加服务器") },
-                                                leadingIcon = { Icon(Icons.Filled.Add, contentDescription = null) },
-                                                onClick = {
-                                                    moreMenuExpanded = false
-                                                    openServerDialog(NetworkProtocol.SMB)
-                                                },
-                                            )
                                             if (isNetworkDir) {
                                                 DropdownMenuItem(
                                                     text = { Text("返回网络主页") },
@@ -621,29 +628,6 @@ fun FileBrowserContent(
                 }
             }
         },
-        floatingActionButton = {
-            when (selectedTab) {
-                MainTab.Browse -> {
-                    if (currentDir != null) {
-                        FloatingActionButton(
-                            onClick = {
-                                createFolderName = ""
-                                createFolderDialog = true
-                            },
-                        ) {
-                            Icon(Icons.Filled.CreateNewFolder, contentDescription = "新建文件夹")
-                        }
-                    }
-                }
-                MainTab.Network -> {
-                    FloatingActionButton(
-                        onClick = { openServerDialog(NetworkProtocol.SMB) },
-                    ) {
-                        Icon(Icons.Filled.Add, contentDescription = "添加服务器")
-                    }
-                }
-            }
-        },
         bottomBar = {
             NavigationBar {
                 MainTab.entries.forEach { tab ->
@@ -675,8 +659,8 @@ fun FileBrowserContent(
                             is FileBrowserUiState.Success -> {
                                 LazyColumn(
                                     modifier = Modifier.fillMaxSize(),
-                                    contentPadding = PaddingValues(horizontal = 20.dp, vertical = 12.dp),
-                                    verticalArrangement = Arrangement.spacedBy(6.dp),
+                                    contentPadding = PaddingValues(horizontal = 16.dp, vertical = 6.dp),
+                                    verticalArrangement = Arrangement.spacedBy(2.dp),
                                 ) {
                                     item {
                                         Text(
@@ -739,8 +723,8 @@ fun FileBrowserContent(
                             is FileBrowserUiState.Success -> {
                                 LazyColumn(
                                     modifier = Modifier.fillMaxSize(),
-                                    contentPadding = PaddingValues(horizontal = 20.dp, vertical = 12.dp),
-                                    verticalArrangement = Arrangement.spacedBy(6.dp),
+                                    contentPadding = PaddingValues(horizontal = 16.dp, vertical = 6.dp),
+                                    verticalArrangement = Arrangement.spacedBy(2.dp),
                                 ) {
                                     item {
                                         Text(
@@ -1113,12 +1097,13 @@ private fun FlatFileRow(
     onClick: () -> Unit,
     onLongClick: () -> Unit,
 ) {
+    val fileTypeIconSize = 60.dp // 40.dp * 1.5
     val defaultFileTint = MaterialTheme.colorScheme.onSurfaceVariant
     val iconStyle = remember(item.isDirectory, item.name, defaultFileTint) {
         fileIconStyleFor(item = item, defaultFileTint = defaultFileTint)
     }
 
-    val selectedBg = MaterialTheme.colorScheme.primaryContainer.copy(alpha = 0.6f)
+    val selectedBg = GeekSelectionBackground
     val rowBg = if (selected) selectedBg else Color.Transparent
 
     // 某些设备/注入事件（例如 adb swipe 模拟长按）可能在触发 long press 后仍回落触发一次 click。
@@ -1145,26 +1130,32 @@ private fun FlatFileRow(
                     onLongClick()
                 },
             )
-            .padding(horizontal = 12.dp, vertical = 14.dp),
+            // 0.3 留白压缩过于激进：这里把列表项垂直留白回调到约 1.5 倍，恢复“呼吸感”。
+            .padding(horizontal = 10.dp, vertical = 12.dp),
         verticalAlignment = Alignment.CenterVertically,
-        horizontalArrangement = Arrangement.spacedBy(14.dp),
+        horizontalArrangement = Arrangement.spacedBy(10.dp),
     ) {
-        Icon(
-            imageVector = iconStyle.icon,
-            contentDescription = null,
-            tint = iconStyle.tint,
-            modifier = Modifier.size(48.dp),
-        )
+        Box(
+            modifier = Modifier.size(fileTypeIconSize),
+            contentAlignment = Alignment.Center,
+        ) {
+            Icon(
+                imageVector = iconStyle.icon,
+                contentDescription = null,
+                tint = iconStyle.tint,
+                modifier = Modifier.fillMaxSize(),
+            )
+        }
 
         Column(modifier = Modifier.weight(1f)) {
             Text(
                 text = item.displayName,
+                // 恢复长文件名双排显示：多出部分省略。
                 maxLines = 2,
                 overflow = TextOverflow.Ellipsis,
                 color = MaterialTheme.colorScheme.onBackground,
-                style = MaterialTheme.typography.bodyLarge.copy(
-                    lineBreak = androidx.compose.ui.text.style.LineBreak.Simple
-                ),
+                // 关键：保持 maxLines=2 + Ellipsis，并显式启用 LineBreak.Simple。
+                style = TextStyle(lineBreak = LineBreak.Simple).merge(MaterialTheme.typography.bodyLarge),
             )
             Text(
                 text = item.subtitle,
@@ -1177,6 +1168,10 @@ private fun FlatFileRow(
             Checkbox(
                 checked = selected,
                 onCheckedChange = { onClick() },
+                colors = CheckboxDefaults.colors(
+                    checkedColor = Color.Gray,
+                    checkmarkColor = Color.White,
+                ),
             )
         }
     }
@@ -1423,20 +1418,21 @@ private fun FileListSkeleton() {
 
     LazyColumn(
         modifier = Modifier.fillMaxSize(),
-        contentPadding = PaddingValues(horizontal = 20.dp, vertical = 12.dp),
-        verticalArrangement = Arrangement.spacedBy(6.dp),
+        contentPadding = PaddingValues(horizontal = 16.dp, vertical = 6.dp),
+        verticalArrangement = Arrangement.spacedBy(2.dp),
     ) {
         items(8) {
             Row(
                 modifier = Modifier
                     .fillMaxWidth()
-                    .padding(vertical = 10.dp),
+                    // 与真实列表项的垂直节奏保持一致（约 1.5x）。
+                    .padding(vertical = 9.dp),
                 verticalAlignment = Alignment.CenterVertically,
-                horizontalArrangement = Arrangement.spacedBy(14.dp),
+                horizontalArrangement = Arrangement.spacedBy(10.dp),
             ) {
                 SkeletonBlock(
-                    width = 48.dp,
-                    height = 48.dp,
+                    width = 60.dp,
+                    height = 60.dp,
                     color = blockColor,
                     shape = RoundedCornerShape(6.dp),
                 )
